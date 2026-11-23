@@ -43,15 +43,28 @@
   #atline { flex:1; width:auto; }
   .hint { color:var(--dim); font-size:12px; }
   #nousb { padding:30px; display:none; }
+  dialog#msg { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:10px; padding:0; width:min(460px, 92vw); box-shadow:0 12px 40px rgba(0,0,0,.6); }
+  dialog#msg::backdrop { background:rgba(0,0,0,.55); }
+  #msg header { border-bottom:1px solid var(--line); padding:12px 16px; gap:10px; }
+  #msg header h2 { font-size:15px; margin:0; font-weight:600; }
+  #msg.error header h2 { color:#ff8f8f; }
+  #msg .spin { width:14px; height:14px; border:2px solid var(--line); border-top-color:var(--accent); border-radius:50%; animation:spin .9s linear infinite; display:none; }
+  #msg.busy .spin { display:inline-block; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  #msgbody { padding:12px 16px 4px; max-height:50vh; overflow:auto; }
+  #msgbody p { margin:0 0 8px; line-height:1.5; }
+  #msgbody p.dim { color:var(--dim); font-size:13px; }
+  #msg footer { padding:8px 16px 14px; text-align:right; }
 </style>
 </head>
 <body>
 <header>
   <h1>LoRa Bridge</h1>
-  <button id="connect" class="primary">连接设备</button>
+  <button id="connect" class="primary">USB 连接</button>
+  <button id="connectble" class="primary">蓝牙连接</button>
   <div id="status"><span class="badge" id="mode">----</span><span id="stext">未连接</span></div>
 </header>
-<div id="nousb">此浏览器不支持 WebUSB。请使用 Chrome / Edge（桌面版或 Android），并通过 https 或 http://localhost 打开本页面。</div>
+<div id="nousb">此浏览器不支持 WebUSB 和 Web Bluetooth。请使用 Chrome / Edge（桌面版或 Android），并通过 https 或 http://localhost 打开本页面。</div>
 <main>
   <div id="termwrap"><div id="term"></div></div>
   <aside>
@@ -74,6 +87,11 @@
     </div>
   </aside>
 </main>
+<dialog id="msg">
+  <header><span class="spin"></span><h2 id="msgtitle"></h2></header>
+  <div id="msgbody"></div>
+  <footer><button id="msgcancel" hidden>取消</button><button id="msgok" class="primary">确定</button></footer>
+</dialog>
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
 <script src="bridge.js"></script>

@@ -65,6 +65,41 @@ void applyOutputs() {
   digitalWrite(PIN_T3G, (cfg.outputs & 4) ? HIGH : LOW);
 }
 
+// ---- watchdog + "where was the main loop" breadcrumb
+// If the main loop ever stops, the watchdog resets the device after 12 s instead of leaving
+// it dead, and the stage it was stuck in is reported after the restart (ATI / AT+HW).
+uint32_t g_resetReason = 0;
+uint8_t g_hangStage = 0;
+uint8_t g_bootMark = 0;
+// Breadcrumb that survives a watchdog reset: RAM keeps its contents, but the start-up code
+// zeroes .bss and the bootloader uses the low RAM and the top (its stack) on the way through.
+// This address is far above anything the heap reaches (heap starts near 0x20010000 and holds
+// a few kB) and below both stacks.
+#define g_crumb ((volatile uint32_t*)0x2003C000)
+#define CRUMB_MAGIC 0xC0FFEE00u
+static uint8_t curStage = 0xFF;
+static void stage(uint8_t s) {
+  if (s == curStage) return;
+  curStage = s;
+  g_crumb[0] = CRUMB_MAGIC | s;
+  g_crumb[1] = ~(CRUMB_MAGIC | s);
+}
+const char* stageName(uint8_t s) {
+  static const char* const names[] = {"-", "usb", "webusb", "ble", "battery", "lora", "button", "led", "display", "idle", "setup"};
+  return s < sizeof(names) / sizeof(names[0]) ? names[s] : "?";
+}
+static void watchdogStart() {
+  NRF_WDT->CONFIG = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos) | (WDT_CONFIG_HALT_Pause << WDT_CONFIG_HALT_Pos);
+  NRF_WDT->CRV = 32768u * 12;
+  NRF_WDT->RREN = WDT_RREN_RR0_Msk;
+  NRF_WDT->TASKS_START = 1;
+  // GPREGRET2 survives a software / pin reset but is cleared by a watchdog reset (and the
+  // bootloader wipes RESETREAS), so "marker gone + breadcrumb in RAM intact" = watchdog.
+  sd_power_gpregret_clr(1, 0xFF);
+  sd_power_gpregret_set(1, 0x5A);
+}
+static inline void watchdogFeed() { NRF_WDT->RR[0] = WDT_RR_RR_Reload; }
+
 static int rebootMode = -1;
 static uint32_t rebootAt = 0;
 void scheduleReboot(uint8_t mode) {
@@ -283,6 +318,19 @@ static void ledTask() {
 
 // ------------------------------------------------------------------ setup / loop
 void setup() {
+  // SoftDevice is not running yet: POWER registers may be accessed directly
+  g_resetReason = NRF_POWER->RESETREAS;
+  NRF_POWER->RESETREAS = g_resetReason;  // write 1 to clear
+  uint8_t mark = (uint8_t)NRF_POWER->GPREGRET2;
+  NRF_POWER->GPREGRET2 = 0;
+  g_bootMark = mark;
+  uint32_t c0 = g_crumb[0], c1 = g_crumb[1];
+  g_crumb[0] = g_crumb[1] = 0;
+  if (mark != 0x5A && (c0 & 0xFFFFFF00u) == CRUMB_MAGIC && c1 == ~c0) {
+    g_resetReason |= 0x2;  // watchdog
+    g_hangStage = (uint8_t)c0;
+  }
+
   // WebUSB interface (browser client). It is added after the core started USB, so re-enumerate.
   TinyUSBDevice.setDeviceVersion(0x0110);  // new bcdDevice: Windows re-reads the WinUSB descriptors
   usbWeb.begin();
@@ -317,23 +365,35 @@ void setup() {
   battery::begin();
   link::setRxHandler(onLoraRx);
   link::begin();
+  watchdogStart();
 }
 
 void loop() {
   uint32_t t = millis();
+  watchdogFeed();
+  stage(1);
   usbTask();
+  stage(2);
   webTask();
+  stage(3);
   bleTask();
 
+  stage(4);
   battery::loop();
   link::setLocalBattery(battery::percent());
   ble::setBattery(battery::percent());
-  link::setActive(usbActive() || ble::uartReady());
+  // "in use": USB plugged in / WebUSB client / a Bluetooth central connected
+  link::setActive(usbActive() || ble::connected());
+  stage(5);
   link::loop();
 
+  stage(6);
   buttonTask();
+  stage(7);
   ledTask();
+  stage(8);
   display::loop();
+  stage(9);
 
   if (rebootMode >= 0 && (int32_t)(millis() - rebootAt) >= 0) {
     if (rebootMode == 1) enterUf2Dfu();

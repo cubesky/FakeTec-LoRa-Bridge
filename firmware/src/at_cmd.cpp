@@ -10,6 +10,17 @@ namespace display { const char* probeInfo(); }
 #include "pins.h"
 
 extern void applyOutputs();
+extern uint32_t g_resetReason;
+extern uint8_t g_hangStage;
+extern const char* stageName(uint8_t s);
+extern uint8_t g_bootMark;
+static void printReset(Print& o) {
+  o.printf("Boot mark: 0x%02X\r\n", g_bootMark);
+  // RESETREAS: bit0 pin, bit1 watchdog, bit2 soft reset, bit3 lockup
+  if (g_resetReason & 0x2) o.printf("Last reset: WATCHDOG - main loop was stuck in stage %u (%s)\r\n", g_hangStage, stageName(g_hangStage));
+  else o.printf("Last reset: 0x%lX (%s)\r\n", (unsigned long)g_resetReason,
+                (g_resetReason & 0x8) ? "CPU lockup" : (g_resetReason & 0x4) ? "software" : (g_resetReason & 0x1) ? "reset pin" : "power on");
+}
 extern void scheduleReboot(uint8_t mode);  // 0 = reboot, 1 = UF2/serial DFU, 2 = OTA DFU
 
 namespace at {
@@ -168,7 +179,7 @@ static const IntParam kInts[] = {
     {"PSM", &cfg.powerSave, 'B', 0, 1, APPLY_RADIO},
     {"SBHB", &cfg.standbyHbS, 'H', 5, 3600, APPLY_NONE},
     {"USBACT", &cfg.usbActive, 'B', 0, 1, APPLY_NONE},
-    {"BLEPAIR", &cfg.blePair, 'B', 0, 1, APPLY_REBOOT},
+    {"BLEPAIR", &cfg.blePair, 'B', 0, 3, APPLY_REBOOT},
     {"BLE", &cfg.bleEnable, 'B', 0, 1, APPLY_REBOOT},
     {"BLEPIN", &cfg.blePin, 'I', 0, 999999, APPLY_REBOOT},
     {"OLED", &cfg.oledTimeoutS, 'H', 0, 65535, APPLY_NONE},
@@ -262,6 +273,7 @@ static void printInfo(Print& o) {
            battery::usbPowered() ? "(USB)" : "");
   o.printf("BLE: %s\r\n", ble::connected() ? "connected" : "idle");
   o.printf("OLED: %s\r\n", display::info());
+  if (g_resetReason & 0xA) printReset(o);
 }
 
 static void printStats(Print& o) {
@@ -491,6 +503,7 @@ void execute(const char* lineIn, Print& o, Port* port) {
              (const char*)&NRF_FICR->INFO.VARIANT, (unsigned long)NRF_FICR->INFO.RAM,
              (unsigned long)NRF_FICR->INFO.FLASH);
     o.printf("OLED: %s | %s\r\n", display::info(), display::probeInfo());
+    printReset(o);
     return ok(o);
   }
   if (!strcmp(name, "I2C")) {
@@ -520,6 +533,25 @@ void execute(const char* lineIn, Print& o, Port* port) {
              cfg.peerId ? (link::isMaster() ? "M" : "S") : "-", s.rssi, s.snr, battery::percent(),
              battery::usbPowered() ? 1 : 0, (unsigned long)s.txRate, (unsigned long)s.rxRate, s.remoteBatt,
              (unsigned)link::queued(), link::channel(), link::freqMHz(), s.remoteRssi, s.remoteSnr);
+    return;
+  }
+  if (!strcmp(name, "HANG")) {
+    // test of the watchdog: block the main loop on purpose
+    o.print("OK (blocking the main loop, the watchdog resets in ~12 s)\r\n");
+    delay(50);
+    for (;;) {
+    }
+  }
+  if (!strcmp(name, "BLECONFIRM")) {
+    // same as the short button press on a pairing request (for units without a reachable button)
+    if (!ble::pairPending()) return err(o, "no pairing request");
+    ble::pairConfirm(!val || atoi(val) != 0);
+    o.print("OK\r\n");
+    return;
+  }
+  if (!strcmp(name, "BLEST")) {
+    ble::diag(o);
+    o.print("OK\r\n");
     return;
   }
   if (!strcmp(name, "BLEUNBOND")) {

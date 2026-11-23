@@ -372,9 +372,13 @@ void loop() {
     oled->setDrawColor(1);
     oled->drawStr(0, 9, "BLE PAIRING REQUEST");
     oled->setFont(u8g2_font_10x20_tf);
-    oled->drawStr((128 - 60) / 2, 36, ble::pairCode());
+    if (ble::pairNeedsCode()) oled->drawStr((128 - 60) / 2, 36, ble::pairCode());
+    else oled->drawStr((128 - 60) / 2, 36, "ALLOW?");
     oled->setFont(u8g2_font_6x10_tf);
-    if (ble::pairPending()) {
+    if (!ble::pairNeedsCode()) {
+      oled->drawStr(0, 52, "New Bluetooth device");
+      oled->drawStr(0, 63, "Press button = YES");
+    } else if (ble::pairPending()) {
       oled->drawStr(0, 52, "Same code on phone?");
       oled->drawStr(0, 63, "Press button = YES");
     } else {

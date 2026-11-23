@@ -19,11 +19,13 @@ Print& cfgPrint();
 
 // pairing (LE Secure Connections numeric comparison, confirmed with the button)
 bool pairPending();        // waiting for the button
-bool pairShowing();        // a passkey should be on the display
+bool pairShowing();        // a pairing request should be on the display
+bool pairNeedsCode();      // ... with the 6 digit code (numeric comparison / passkey)
 const char* pairCode();    // 6 digits
 void pairConfirm(bool ok);
 uint8_t takePairEvent();   // 0 = none, 1 = paired, 2 = failed
 void clearBonds();
+void diag(Print& out);     // connection counters, last disconnect reason / pairing status
 
 void setBattery(uint8_t pct);
 void disconnect();
