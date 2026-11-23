@@ -1,0 +1,190 @@
+name: build
+
+# Builds everything when a version tag (v*) is pushed and attaches the results to the release
+# of that tag. A manual run builds the same artifacts without publishing a release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    name: Firmware (nRF52840)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('firmware/platformio.ini') }}
+      - run: pip install platformio
+      - name: Build
+        run: pio run -d firmware -e faketec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: firmware/release/*
+          if-no-files-found: error
+
+  rust:
+    name: lbridge (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,  os: ubuntu-latest,  target: x86_64-unknown-linux-musl,  cross: false, bin: lbridge }
+          - { name: linux-aarch64, os: ubuntu-latest,  target: aarch64-unknown-linux-musl, cross: true,  bin: lbridge }
+          - { name: linux-armv7,   os: ubuntu-latest,  target: armv7-unknown-linux-musleabihf, cross: true, bin: lbridge }
+          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc,     cross: false, bin: lbridge.exe }
+          - { name: macos-aarch64, os: macos-latest,   target: aarch64-apple-darwin,       cross: false, bin: lbridge }
+    defaults:
+      run:
+        working-directory: client-rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-rust
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lbridge-${{ matrix.name }}
+          path: client-rust/target/${{ matrix.target }}/release/${{ matrix.bin }}
+          if-no-files-found: error
+
+  web:
+    name: Web console
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check and assemble the static site
+        working-directory: client-web
+        run: |
+          node --check bridge.js
+          node --check app.js
+          npm install --no-audit --no-fund --ignore-scripts @xterm/xterm@5.5.0 @xterm/addon-fit@0.10.0
+          # the vendored copies must match the pinned packages
+          cmp vendor/xterm.js node_modules/@xterm/xterm/lib/xterm.js
+          cmp vendor/xterm.css node_modules/@xterm/xterm/css/xterm.css
+          cmp vendor/addon-fit.js node_modules/@xterm/addon-fit/lib/addon-fit.js
+          mkdir -p ../site
+          cp -r index.html app.js bridge.js vendor 99-lorabridge.rules ../site/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-console
+          path: site
+          if-no-files-found: error
+      - uses: actions/upload-pages-artifact@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          path: site
+
+  pages:
+    name: Publish web console (GitHub Pages)
+    # WebUSB needs https: GitHub Pages provides it. Enable Pages (source: GitHub Actions) in the repository settings.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: web
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  openwrt:
+    name: luci-app-lora-bridge (${{ matrix.format }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # the package is architecture independent; the SDK only decides the package format
+          - { format: ipk, sdk: x86_64-openwrt-24.10 }
+          - { format: apk, sdk: x86_64-openwrt-25.12 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Script permissions and syntax
+        run: |
+          cd openwrt/luci-app-lora-bridge/root
+          chmod 0755 etc/init.d/lora-bridge usr/sbin/lora-bridged usr/bin/lora-bridge
+          for f in usr/sbin/lora-bridged usr/bin/lora-bridge usr/share/lora-bridge/common.sh; do sh -n "$f"; done
+      - name: Build with the OpenWrt SDK
+        uses: openwrt/gh-action-sdk@v9
+        env:
+          ARCH: ${{ matrix.sdk }}
+          FEED_DIR: ${{ github.workspace }}/openwrt
+          FEEDNAME: lorabridge
+          PACKAGES: luci-app-lora-bridge
+          NO_REFRESH_CHECK: 1
+          INDEX: 0
+      - name: Collect packages
+        run: |
+          mkdir -p out
+          find bin -name 'luci-*lora-bridge*' \( -name '*.ipk' -o -name '*.apk' \) -exec cp -v {} out/ \;
+          ls -l out
+          test -n "$(ls out)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-${{ matrix.format }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [firmware, rust, web, openwrt]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Pack
+        run: |
+          mkdir dist
+          cp artifacts/firmware/* dist/
+          for d in artifacts/lbridge-*; do
+            n=$(basename "$d")
+            if [ -f "$d/lbridge.exe" ]; then cp "$d/lbridge.exe" "dist/$n.exe"; else cp "$d/lbridge" "dist/$n"; fi
+          done
+          (cd artifacts/web-console && zip -qr ../../dist/web-console.zip .)
+          cp artifacts/openwrt-ipk/* artifacts/openwrt-apk/* dist/
+          ls -l dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -1,0 +1,101 @@
+#!/bin/sh
+# lora-bridge: status (JSON) and manual control of the LoRa bridge <-> Docker attachment.
+
+. "${LB_LIB:-/usr/share/lora-bridge}/common.sh"
+
+usage() {
+	cat <<EOF
+Usage: lora-bridge <command>
+
+  status [--text]   connection information as JSON (default) or as text
+  start             create/start the container now
+  stop              stop the container
+  recreate          remove the container; it is created again with the current settings
+  logs [n]          last n lines of the container log (default 50)
+  help
+EOF
+}
+
+status_json() {
+	local now found dpath dser dprod dnum present cstate cid cimage cstarted exists mount_ok running pid stop_in up
+	DAEMON_PID= ATTACHED=0 CONNECTED_AT= UNPLUG_AT= LAST_ERROR= MANAGED=0
+	[ -f "$STATE_FILE" ] && . "$STATE_FILE"
+	now=$(date +%s)
+	running=0
+	[ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null && running=1
+	[ "$running" = 1 ] || { ATTACHED=0; CONNECTED_AT=; UNPLUG_AT=; }
+
+	found=$(lb_find_device)
+	present=0
+	if [ -n "$found" ]; then
+		present=1
+		IFS='|' read -r dpath dser dprod dnum <<EOF
+$found
+EOF
+	fi
+
+	exists=0 mount_ok=0
+	cstate=$(lb_c_state)
+	if [ -n "$cstate" ]; then
+		exists=1
+		cid=$($DOCKER inspect -f '{{.Id}}' "$C_NAME" 2>/dev/null | cut -c1-12)
+		cimage=$($DOCKER inspect -f '{{.Config.Image}}' "$C_NAME" 2>/dev/null)
+		cstarted=$($DOCKER inspect -f '{{.State.StartedAt}}' "$C_NAME" 2>/dev/null)
+		lb_c_mount_ok && mount_ok=1
+	fi
+	stop_in=
+	[ -n "$UNPLUG_AT" ] && [ "$STOP_DELAY" -ge 0 ] 2>/dev/null && stop_in=$((UNPLUG_AT + STOP_DELAY - now)) && [ "$stop_in" -lt 0 ] && stop_in=0
+	up=
+	[ -n "$CONNECTED_AT" ] && up=$((now - CONNECTED_AT))
+
+	printf '{'
+	printf '"service":{"enabled":%s,"running":%s,"pid":%s},' "$(lb_jbool "$ENABLED")" "$(lb_jbool "$running")" "$(lb_jnum "$([ "$running" = 1 ] && echo "$DAEMON_PID")")"
+	printf '"device":{"present":%s,"path":%s,"vid":%s,"pid":%s,"serial":%s,"product":%s},' "$(lb_jbool "$present")" \
+		"$(lb_jstr "$dpath")" "$(lb_jstr "$USB_VID")" "$(lb_jstr "$USB_PID")" "$(lb_jstr "$dser")" "$(lb_jstr "$dprod")"
+	printf '"link":{"mode":%s,"attached":%s,"baud":%s,"container_port":%s,"host_port":%s,"connected_since":%s,"connected_seconds":%s},' \
+		"$(lb_jstr "$LINK_MODE")" "$(lb_jbool "$ATTACHED")" "$(lb_jnum "$BAUD")" "$(lb_jstr "$C_MOUNT/$PORT_NAME")" \
+		"$(lb_jstr "$DEVDIR/$PORT_NAME")" "$(lb_jnum "$CONNECTED_AT")" "$(lb_jnum "$up")"
+	printf '"container":{"name":%s,"exists":%s,"state":%s,"id":%s,"image":%s,"started_at":%s,"port_mounted":%s,"managed":%s},' \
+		"$(lb_jstr "$C_NAME")" "$(lb_jbool "$exists")" "$(lb_jstr "$cstate")" "$(lb_jstr "$cid")" "$(lb_jstr "$cimage")" \
+		"$(lb_jstr "$cstarted")" "$(lb_jbool "$mount_ok")" "$(lb_jbool "$MANAGED")"
+	printf '"timer":{"stop_delay":%s,"unplugged_at":%s,"stop_in":%s},' "$(lb_jnum "$STOP_DELAY")" "$(lb_jnum "$UNPLUG_AT")" "$(lb_jnum "$stop_in")"
+	printf '"error":%s' "$(lb_jstr "$LAST_ERROR")"
+	printf '}\n'
+}
+
+status_text() {
+	status_json | sed -e 's/^{//' -e 's/}$//' -e 's/},"/}\n"/g' | sed -e 's/[{}"]//g' -e 's/:/: /' -e 's/,/  /g'
+}
+
+lb_load_config
+case "$1" in
+status|'')
+	if [ "$2" = --text ] || [ "$2" = -t ]; then status_text; else status_json; fi
+	;;
+start)
+	st=$(lb_c_state)
+	if [ -z "$st" ]; then
+		[ -d "$DEVDIR" ] || { echo "start the service first (/etc/init.d/lora-bridge start)" >&2; exit 1; }
+		lb_c_create >/dev/null || exit 1
+	fi
+	$DOCKER start "$C_NAME"
+	;;
+stop)
+	$DOCKER stop -t "$C_STOP_TIMEOUT" "$C_NAME"
+	;;
+recreate)
+	$DOCKER rm -f "$C_NAME" >/dev/null 2>&1
+	[ -f "$PID_FILE" ] && kill -USR1 "$(cat "$PID_FILE")" 2>/dev/null
+	echo "removed; the service creates it again when the device is present"
+	;;
+logs)
+	$DOCKER logs --tail "${2:-50}" "$C_NAME" 2>&1
+	;;
+help|-h|--help)
+	usage
+	;;
+*)
+	usage >&2
+	exit 1
+	;;
+esac

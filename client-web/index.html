@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoRa Bridge</title>
+<link rel="stylesheet" href="vendor/xterm.css">
+<style>
+  :root { --bg:#14171c; --panel:#1c2128; --line:#2d333b; --fg:#d7dde5; --dim:#8b949e; --accent:#3fb6a8; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui,"Segoe UI","Microsoft YaHei",sans-serif; }
+  body { display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:12px; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0 8px 0 0; font-weight:600; }
+  button { background:#262c35; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 12px; cursor:pointer; font:inherit; }
+  button:hover:not(:disabled) { border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#06231f; font-weight:600; }
+  button.danger { color:#ff8f8f; }
+  .badge { display:inline-block; min-width:52px; text-align:center; padding:2px 8px; border-radius:10px; font-weight:700; font-family:ui-monospace,Consolas,monospace; background:#333a44; }
+  .badge.LINK { background:#1f7a3a; color:#fff; } .badge.STBY { background:#1d5f8a; color:#fff; }
+  .badge.NOOP { background:#9b2c2c; color:#fff; } .badge.UNPR { background:#7a3f9b; color:#fff; }
+  .badge.SRCH,.badge.PAIR { background:#9a6b00; color:#fff; }
+  #status { display:flex; gap:14px; align-items:center; color:var(--dim); font-family:ui-monospace,Consolas,monospace; font-size:13px; flex-wrap:wrap; }
+  #status b { color:var(--fg); font-weight:600; }
+  main { flex:1; display:flex; min-height:0; }
+  #termwrap { flex:1; min-width:0; padding:6px; background:#000; }
+  #term { width:100%; height:100%; }
+  aside { width:340px; background:var(--panel); border-left:1px solid var(--line); display:flex; flex-direction:column; min-height:0; }
+  .tabs { display:flex; border-bottom:1px solid var(--line); }
+  .tabs button { flex:1; border:0; border-radius:0; background:none; padding:9px; color:var(--dim); border-bottom:2px solid transparent; }
+  .tabs button.on { color:var(--fg); border-bottom-color:var(--accent); }
+  .pane { flex:1; overflow:auto; padding:10px 12px; display:none; }
+  .pane.on { display:block; }
+  .row { display:flex; align-items:center; gap:8px; margin:5px 0; }
+  .row label { flex:1; color:var(--dim); font-size:13px; }
+  .row label small { color:#5f6873; font-family:ui-monospace,Consolas,monospace; }
+  .row input { width:120px; background:#11151a; color:var(--fg); border:1px solid var(--line); border-radius:5px; padding:4px 6px; font:13px ui-monospace,Consolas,monospace; }
+  .row input.changed { border-color:#d9a400; }
+  h3 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:14px 0 6px; }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; }
+  pre#log { background:#0d1014; border:1px solid var(--line); border-radius:6px; padding:8px; white-space:pre-wrap; word-break:break-all; font:12px/1.45 ui-monospace,Consolas,monospace; min-height:120px; margin:8px 0; }
+  #atline { flex:1; width:auto; }
+  .hint { color:var(--dim); font-size:12px; }
+  #nousb { padding:30px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LoRa Bridge</h1>
+  <button id="connect" class="primary">连接设备</button>
+  <div id="status"><span class="badge" id="mode">----</span><span id="stext">未连接</span></div>
+</header>
+<div id="nousb">此浏览器不支持 WebUSB。请使用 Chrome / Edge（桌面版或 Android），并通过 https 或 http://localhost 打开本页面。</div>
+<main>
+  <div id="termwrap"><div id="term"></div></div>
+  <aside>
+    <div class="tabs"><button data-pane="cfg" class="on">配置</button><button data-pane="ctl">控制</button></div>
+    <div class="pane on" id="cfg">
+      <div class="btns"><button id="reload">读取</button><button id="apply" class="primary">应用修改</button></div>
+      <div id="fields" class="hint">连接后显示设备配置。</div>
+    </div>
+    <div class="pane" id="ctl">
+      <h3>链路</h3>
+      <div class="btns"><button data-at="AT+PAIR">开始配对</button><button data-at="AT+UNPAIR" class="danger">解除配对</button></div>
+      <h3>信息</h3>
+      <div class="btns"><button data-at="ATI">设备信息</button><button data-at="AT+STAT">统计</button><button data-at="AT+RSTAT">清零统计</button><button data-at="AT+HW">硬件诊断</button></div>
+      <h3>设备</h3>
+      <div class="btns"><button data-at="AT+REBOOT">重启</button><button data-at="AT+DFU" class="danger">进入升级模式</button><button data-at="AT+BLEUNBOND" class="danger">清除蓝牙配对</button></div>
+      <h3>AT 命令</h3>
+      <div class="row"><input id="atline" placeholder="AT+FREQ=434.000 或 freq 434" spellcheck="false"><button id="atsend">发送</button></div>
+      <pre id="log"></pre>
+      <div class="hint">终端窗口是到对端的透明串口，支持完整的 ANSI 颜色和控制序列（可直接操作远端 Linux 控制台）。配置命令走独立的带内通道，不会混入串口数据。</div>
+    </div>
+  </aside>
+</main>
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-fit.js"></script>
+<script src="bridge.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,199 @@
+#!/bin/sh
+# lora-bridged: watches for the USB LoRa bridge.
+#   plugged in  -> create/start the container, connect its serial port to the device
+#   unplugged   -> disconnect, keep the container for stop_delay seconds (re-plugging in that
+#                  time just reconnects), then stop it
+#
+# Serial port inside the container: <mount_path>/ttyLORA
+#   pty mode    : a pseudo terminal that exists as long as the container is managed. A small
+#                 socat process holds it, a second one pumps data to the real tty while the
+#                 device is present - so programs in the container keep their port open
+#                 across re-plugging.
+#   device mode : the device node of the real tty.
+
+. "${LB_LIB:-/usr/share/lora-bridge}/common.sh"
+lb_load_config
+
+HOLDER_PID= BRIDGE_PID=
+ATTACHED=0 ATTACHED_DEV= CONNECTED_AT= UNPLUG_AT= LAST_ERROR= MANAGED=0
+DEV_PATH= DEV_SERIAL= DEV_PRODUCT= DEV_NUM=
+
+log() { logger -t lora-bridge "$*" 2>/dev/null || echo "lora-bridge: $*" >&2; }
+alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+
+q() { printf "'%s'" "$(printf '%s' "$1" | tr -d "'\n")"; }
+write_state() {
+	{
+		echo "DAEMON_PID=$$"
+		echo "LINK_MODE=$(q "$LINK_MODE")"
+		echo "DEVICE_PRESENT=$([ -n "$DEV_PATH" ] && echo 1 || echo 0)"
+		echo "DEVICE_PATH=$(q "$DEV_PATH")"
+		echo "DEVICE_SERIAL=$(q "$DEV_SERIAL")"
+		echo "DEVICE_PRODUCT=$(q "$DEV_PRODUCT")"
+		echo "ATTACHED=$ATTACHED"
+		echo "CONNECTED_AT=$CONNECTED_AT"
+		echo "UNPLUG_AT=$UNPLUG_AT"
+		echo "MANAGED=$MANAGED"
+		echo "LAST_ERROR=$(q "$LAST_ERROR")"
+	} > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+# ---- shared directory that carries the port into the container
+prepare_devdir() {
+	mkdir -p "$DEVDIR"
+	[ -n "$LB_NO_MOUNT" ] && return 0
+	grep -q " $DEVDIR tmpfs " /proc/mounts && return 0
+	# own tmpfs: /tmp is mounted nodev on OpenWrt; shared so that later bind mounts
+	# (the pty) propagate into the running container
+	mount -t tmpfs -o mode=0755,size=64k lora-bridge "$DEVDIR" || return 1
+	mount --make-shared "$DEVDIR" 2>/dev/null || mount --make-rshared "$DEVDIR" 2>/dev/null ||
+		log "cannot make $DEVDIR a shared mount (pty mode needs it)"
+}
+
+port_unpublish() {
+	if [ -z "$LB_NO_MOUNT" ]; then
+		while grep -q " $DEVDIR/$PORT_NAME " /proc/mounts; do umount "$DEVDIR/$PORT_NAME" || break; done
+	fi
+	rm -f "${DEVDIR:?}/${PORT_NAME:?}"
+}
+
+# ---- pty mode
+holder_start() {
+	alive "$HOLDER_PID" && return 0
+	port_unpublish
+	rm -f "${RUN:?}/pty.app" "${RUN:?}/pty.host"
+	socat "PTY,link=$RUN/pty.app,rawer,mode=0666,ignoreeof" "PTY,link=$RUN/pty.host,rawer,ignoreeof" &
+	HOLDER_PID=$!
+	local i=0
+	while [ ! -e "$RUN/pty.app" ] || [ ! -e "$RUN/pty.host" ]; do
+		i=$((i + 1))
+		[ $i -gt 30 ] && { LAST_ERROR="socat did not create the virtual port"; return 1; }
+		alive "$HOLDER_PID" || { LAST_ERROR="socat failed to start (is it installed?)"; HOLDER_PID=; return 1; }
+		sleep 0.1 2>/dev/null || sleep 1
+	done
+	if [ -n "$LB_NO_MOUNT" ]; then
+		ln -sf "$(readlink -f "$RUN/pty.app")" "$DEVDIR/$PORT_NAME"
+	else
+		: > "$DEVDIR/$PORT_NAME"
+		mount --bind "$(readlink -f "$RUN/pty.app")" "$DEVDIR/$PORT_NAME" ||
+			{ LAST_ERROR="cannot publish the virtual port in $DEVDIR"; return 1; }
+	fi
+}
+
+holder_stop() {
+	alive "$HOLDER_PID" && kill "$HOLDER_PID" 2>/dev/null
+	HOLDER_PID=
+	port_unpublish
+	rm -f "${RUN:?}/pty.app" "${RUN:?}/pty.host"
+}
+
+# ---- container
+ensure_container() {
+	local st out
+	prepare_devdir || { LAST_ERROR="cannot prepare $DEVDIR"; return 1; }
+	if [ "$LINK_MODE" = pty ]; then holder_start || return 1; fi
+	st=$(lb_c_state)
+	if [ -z "$st" ]; then
+		[ "$C_CREATE" = 1 ] || { LAST_ERROR="container '$C_NAME' does not exist"; return 1; }
+		log "creating container $C_NAME from $C_IMAGE"
+		out=$(lb_c_create 2>&1) || { LAST_ERROR="create failed: $out"; return 1; }
+		st=created
+	fi
+	if [ "$st" != running ]; then
+		log "starting container $C_NAME"
+		out=$($DOCKER start "$C_NAME" 2>&1) || { LAST_ERROR="start failed: $out"; return 1; }
+	fi
+	MANAGED=1
+	lb_c_mount_ok || { LAST_ERROR="container '$C_NAME' does not mount $DEVDIR (add: -v $DEVDIR:$C_MOUNT:rslave)"; return 0; }
+	LAST_ERROR=
+}
+
+stop_container() {
+	if [ "$(lb_c_state)" = running ]; then
+		log "device gone for ${STOP_DELAY}s: stopping container $C_NAME"
+		$DOCKER stop -t "$C_STOP_TIMEOUT" "$C_NAME" >/dev/null 2>&1 || LAST_ERROR="stop failed"
+	fi
+	MANAGED=0
+	holder_stop
+}
+
+# ---- device <-> port
+attach() {
+	local dev=$1
+	if [ "$LINK_MODE" = pty ]; then
+		socat "$RUN/pty.host,rawer" "$dev,rawer,b$BAUD,clocal=1" 2>/dev/null &
+		BRIDGE_PID=$!
+	else
+		port_unpublish
+		mknod "$DEVDIR/$PORT_NAME" c "${DEV_NUM%%:*}" "${DEV_NUM##*:}" && chmod 0666 "$DEVDIR/$PORT_NAME" ||
+			{ LAST_ERROR="mknod failed"; return 1; }
+	fi
+	ATTACHED=1
+	ATTACHED_DEV=$dev
+	CONNECTED_AT=$(date +%s)
+	log "$dev connected to $C_NAME:$C_MOUNT/$PORT_NAME ($LINK_MODE)"
+}
+
+detach() {
+	if [ "$LINK_MODE" = pty ]; then
+		alive "$BRIDGE_PID" && kill "$BRIDGE_PID" 2>/dev/null
+		BRIDGE_PID=
+	else
+		port_unpublish
+	fi
+	[ "$ATTACHED" = 1 ] && log "$ATTACHED_DEV disconnected"
+	ATTACHED=0 ATTACHED_DEV= CONNECTED_AT=
+}
+
+still_attached() {
+	[ "$ATTACHED" = 1 ] || return 1
+	[ "$ATTACHED_DEV" = "$DEV_PATH" ] || return 1
+	if [ "$LINK_MODE" = pty ]; then alive "$BRIDGE_PID"; else [ -e "$DEVDIR/$PORT_NAME" ]; fi
+}
+
+cleanup() {
+	trap - TERM INT
+	detach
+	holder_stop
+	[ -z "$LB_NO_MOUNT" ] && umount "$DEVDIR" 2>/dev/null
+	rm -f "${PID_FILE:?}" "${STATE_FILE:?}"
+	exit 0
+}
+
+mkdir -p "$RUN"
+echo $$ > "$PID_FILE"
+trap cleanup TERM INT
+trap : USR1
+log "started (mode $LINK_MODE, container $C_NAME, stop delay ${STOP_DELAY}s)"
+
+while :; do
+	found=$(lb_find_device)
+	now=$(date +%s)
+	if [ -n "$found" ]; then
+		IFS='|' read -r DEV_PATH DEV_SERIAL DEV_PRODUCT DEV_NUM <<EOF
+$found
+EOF
+		UNPLUG_AT=
+		if ! still_attached; then
+			[ "$ATTACHED" = 1 ] && detach
+			if ensure_container; then attach "$DEV_PATH"; else log "$LAST_ERROR"; fi
+		elif [ "$(lb_c_state)" != running ]; then
+			# container died or was stopped by hand while the device is in
+			ensure_container || log "$LAST_ERROR"
+		fi
+	else
+		DEV_PATH= DEV_SERIAL= DEV_PRODUCT= DEV_NUM=
+		if [ "$ATTACHED" = 1 ]; then
+			detach
+			UNPLUG_AT=$now
+			log "device unplugged, container stops in ${STOP_DELAY}s unless it comes back"
+		fi
+		if [ -n "$UNPLUG_AT" ] && [ "$STOP_DELAY" -ge 0 ] 2>/dev/null && [ $((now - UNPLUG_AT)) -ge "$STOP_DELAY" ]; then
+			stop_container
+			UNPLUG_AT=
+		fi
+	fi
+	write_state
+	sleep "${POLL:-2}" &
+	wait $!
+done

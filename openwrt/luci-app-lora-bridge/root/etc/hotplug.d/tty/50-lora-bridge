@@ -1,0 +1,6 @@
+# wake the daemon as soon as a serial port appears or disappears (it also polls)
+case "$ACTION" in
+add|remove)
+	[ -f /var/run/lora-bridge/daemon.pid ] && kill -USR1 "$(cat /var/run/lora-bridge/daemon.pid)" 2>/dev/null
+	;;
+esac

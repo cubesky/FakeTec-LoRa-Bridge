@@ -1,0 +1,20 @@
+{
+	"luci-app-lora-bridge": {
+		"description": "Grant access to the LoRa Bridge Docker attachment",
+		"read": {
+			"uci": [ "lora-bridge" ],
+			"file": {
+				"/usr/bin/lora-bridge status": [ "exec" ],
+				"/usr/bin/lora-bridge logs": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "lora-bridge" ],
+			"file": {
+				"/usr/bin/lora-bridge start": [ "exec" ],
+				"/usr/bin/lora-bridge stop": [ "exec" ],
+				"/usr/bin/lora-bridge recreate": [ "exec" ]
+			}
+		}
+	}
+}

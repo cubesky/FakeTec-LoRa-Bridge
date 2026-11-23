@@ -1,0 +1,4 @@
+# file modes do not survive every way of packaging: make sure the scripts are executable
+chmod 0755 /etc/init.d/lora-bridge /usr/sbin/lora-bridged /usr/bin/lora-bridge 2>/dev/null
+/etc/init.d/lora-bridge enable 2>/dev/null
+exit 0

@@ -1,0 +1,16 @@
+{
+  "name": "lorabridge-web",
+  "version": "1.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "WebUSB client for the FakeTec LoRa serial bridge",
+  "scripts": {
+    "serve": "python -m http.server 8080",
+    "test": "node test/usb-test.js"
+  },
+  "devDependencies": {
+    "@xterm/addon-fit": "0.10.0",
+    "@xterm/xterm": "5.5.0",
+    "usb": "^2.14.0"
+  }
+}

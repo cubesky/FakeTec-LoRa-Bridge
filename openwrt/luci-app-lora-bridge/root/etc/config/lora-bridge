@@ -1,0 +1,31 @@
+config main 'main'
+	option enabled '0'
+	# USB IDs of the bridge (FakeTec LoRa Bridge firmware)
+	option usb_vid '239a'
+	option usb_pid '00b3'
+	# optional: only this USB serial number
+	option usb_serial ''
+	option baud '115200'
+	# pty    = persistent virtual serial port (survives re-plugging, needs socat)
+	# device = the real tty node is passed through
+	option link_mode 'pty'
+	# seconds between unplugging and stopping the container; -1 = never stop
+	option stop_delay '300'
+	option poll_interval '2'
+
+config container 'container'
+	option name 'lora-bridge'
+	# create the container if it does not exist
+	option create '1'
+	option image 'alpine:latest'
+	option command 'sleep infinity'
+	# directory inside the container that holds the serial port (<mount_path>/ttyLORA)
+	option mount_path '/dev/lora'
+	option network 'bridge'
+	option restart_policy 'no'
+	option privileged '0'
+	option stop_timeout '10'
+	#list env 'TZ=UTC'
+	#list volume '/opt/app:/data'
+	#list port '8080:80'
+	option extra_args ''

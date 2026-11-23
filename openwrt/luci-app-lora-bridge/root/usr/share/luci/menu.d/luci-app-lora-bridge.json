@@ -1,0 +1,14 @@
+{
+	"admin/services/lora-bridge": {
+		"title": "LoRa Bridge",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "lora-bridge/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-lora-bridge" ],
+			"uci": { "lora-bridge": true }
+		}
+	}
+}

@@ -1,0 +1,20 @@
+[package]
+name = "lbridge"
+version = "1.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Client for the FakeTec LoRa serial bridge: terminal + configuration"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+serialport = { version = "4", default-features = false }  # no libudev needed on Linux
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

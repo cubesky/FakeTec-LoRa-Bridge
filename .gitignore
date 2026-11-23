@@ -1,0 +1,9 @@
+# PlatformIO
+firmware/.pio/
+firmware/release/
+.vscode/
+# Rust
+client-rust/target/
+# Node
+client-web/node_modules/# schematic files are kept outside the repository
+hardware/

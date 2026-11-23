@@ -1,0 +1,180 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8"
+
+msgid "LoRa Bridge"
+msgstr ""
+
+msgid "Status not available."
+msgstr ""
+
+msgid "not created"
+msgstr ""
+
+msgid "Service"
+msgstr ""
+
+msgid "running"
+msgstr ""
+
+msgid "stopped"
+msgstr ""
+
+msgid "disabled"
+msgstr ""
+
+msgid "Device"
+msgstr ""
+
+msgid "plugged in"
+msgstr ""
+
+msgid "not present"
+msgstr ""
+
+msgid "Serial link"
+msgstr ""
+
+msgid "connected"
+msgstr ""
+
+msgid "not connected"
+msgstr ""
+
+msgid "Container"
+msgstr ""
+
+msgid "Auto stop"
+msgstr ""
+
+msgid "container stops in %s"
+msgstr ""
+
+msgid "Warning"
+msgstr ""
+
+msgid "The container does not mount the port directory. Recreate it or add the volume by hand."
+msgstr ""
+
+msgid "Last error"
+msgstr ""
+
+msgid "Command failed"
+msgstr ""
+
+msgid "Starts (or creates) a Docker container when the USB LoRa bridge is plugged in and connects a virtual serial port inside the container to it. Some time after the device was unplugged the container is stopped; plugging it back in before that just reconnects."
+msgstr ""
+
+msgid "Enable"
+msgstr ""
+
+msgid "USB vendor ID"
+msgstr ""
+
+msgid "USB product ID"
+msgstr ""
+
+msgid "Empty: any product of this vendor."
+msgstr ""
+
+msgid "USB serial number"
+msgstr ""
+
+msgid "Only use the device with this serial number. Empty: the first one found."
+msgstr ""
+
+msgid "Serial port in the container"
+msgstr ""
+
+msgid "Virtual serial port (stays open across re-plugging)"
+msgstr ""
+
+msgid "Real device node (programs must reopen it after re-plugging)"
+msgstr ""
+
+msgid "Baud rate"
+msgstr ""
+
+msgid "Stop delay (seconds)"
+msgstr ""
+
+msgid "Time between unplugging and stopping the container. -1: never stop it."
+msgstr ""
+
+msgid "Docker container"
+msgstr ""
+
+msgid "Container name"
+msgstr ""
+
+msgid "Create if missing"
+msgstr ""
+
+msgid "Create the container with the settings below when it does not exist. Otherwise an existing container of that name is only started and stopped."
+msgstr ""
+
+msgid "Image"
+msgstr ""
+
+msgid "Command"
+msgstr ""
+
+msgid "Empty: the default command of the image."
+msgstr ""
+
+msgid "Port directory in the container"
+msgstr ""
+
+msgid "The serial port appears as ttyLORA in this directory, e.g. /dev/lora/ttyLORA. It is also passed as environment variable LORA_BRIDGE_PORT."
+msgstr ""
+
+msgid "Network"
+msgstr ""
+
+msgid "Restart policy"
+msgstr ""
+
+msgid "no"
+msgstr ""
+
+msgid "Privileged"
+msgstr ""
+
+msgid "Environment variables"
+msgstr ""
+
+msgid "Volumes"
+msgstr ""
+
+msgid "Published ports"
+msgstr ""
+
+msgid "Extra arguments"
+msgstr ""
+
+msgid "Appended to \"docker create\"."
+msgstr ""
+
+msgid "Stop timeout (seconds)"
+msgstr ""
+
+msgid "Status"
+msgstr ""
+
+msgid "Container started."
+msgstr ""
+
+msgid "Start container"
+msgstr ""
+
+msgid "Container stopped."
+msgstr ""
+
+msgid "Stop container"
+msgstr ""
+
+msgid "Container removed; it is created again when the device is present."
+msgstr ""
+
+msgid "Recreate container"
+msgstr ""
+

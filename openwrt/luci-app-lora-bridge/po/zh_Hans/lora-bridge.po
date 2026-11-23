@@ -1,0 +1,180 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8\nLanguage: zh_Hans\n"
+
+msgid "LoRa Bridge"
+msgstr "LoRa Bridge"
+
+msgid "Status not available."
+msgstr "无法获取状态。"
+
+msgid "not created"
+msgstr "未创建"
+
+msgid "Service"
+msgstr "服务"
+
+msgid "running"
+msgstr "运行中"
+
+msgid "stopped"
+msgstr "已停止"
+
+msgid "disabled"
+msgstr "未启用"
+
+msgid "Device"
+msgstr "设备"
+
+msgid "plugged in"
+msgstr "已插入"
+
+msgid "not present"
+msgstr "未插入"
+
+msgid "Serial link"
+msgstr "串口连接"
+
+msgid "connected"
+msgstr "已连接"
+
+msgid "not connected"
+msgstr "未连接"
+
+msgid "Container"
+msgstr "容器"
+
+msgid "Auto stop"
+msgstr "自动停止"
+
+msgid "container stops in %s"
+msgstr "容器将在 %s 后停止"
+
+msgid "Warning"
+msgstr "警告"
+
+msgid "The container does not mount the port directory. Recreate it or add the volume by hand."
+msgstr "容器没有挂载串口目录。请重建容器，或手动添加该卷。"
+
+msgid "Last error"
+msgstr "最近的错误"
+
+msgid "Command failed"
+msgstr "命令执行失败"
+
+msgid "Starts (or creates) a Docker container when the USB LoRa bridge is plugged in and connects a virtual serial port inside the container to it. Some time after the device was unplugged the container is stopped; plugging it back in before that just reconnects."
+msgstr "检测到 USB LoRa Bridge 插入时启动（或创建）一个 Docker 容器，并把容器内的虚拟串口连接到该设备。设备拔出一段时间后停止容器；在此之前重新插入只会重新连接，不会停止容器。"
+
+msgid "Enable"
+msgstr "启用"
+
+msgid "USB vendor ID"
+msgstr "USB 厂商 ID"
+
+msgid "USB product ID"
+msgstr "USB 产品 ID"
+
+msgid "Empty: any product of this vendor."
+msgstr "留空：该厂商的任意产品。"
+
+msgid "USB serial number"
+msgstr "USB 序列号"
+
+msgid "Only use the device with this serial number. Empty: the first one found."
+msgstr "只使用该序列号的设备。留空：使用找到的第一个。"
+
+msgid "Serial port in the container"
+msgstr "容器内的串口"
+
+msgid "Virtual serial port (stays open across re-plugging)"
+msgstr "虚拟串口（重新插拔时保持打开）"
+
+msgid "Real device node (programs must reopen it after re-plugging)"
+msgstr "真实设备节点（重新插拔后程序需重新打开）"
+
+msgid "Baud rate"
+msgstr "波特率"
+
+msgid "Stop delay (seconds)"
+msgstr "停止延时（秒）"
+
+msgid "Time between unplugging and stopping the container. -1: never stop it."
+msgstr "从拔出到停止容器的时间。-1：从不停止。"
+
+msgid "Docker container"
+msgstr "Docker 容器"
+
+msgid "Container name"
+msgstr "容器名称"
+
+msgid "Create if missing"
+msgstr "不存在时创建"
+
+msgid "Create the container with the settings below when it does not exist. Otherwise an existing container of that name is only started and stopped."
+msgstr "容器不存在时按下面的设置创建。否则只启动和停止该名称的已有容器。"
+
+msgid "Image"
+msgstr "镜像"
+
+msgid "Command"
+msgstr "命令"
+
+msgid "Empty: the default command of the image."
+msgstr "留空：使用镜像的默认命令。"
+
+msgid "Port directory in the container"
+msgstr "容器内的串口目录"
+
+msgid "The serial port appears as ttyLORA in this directory, e.g. /dev/lora/ttyLORA. It is also passed as environment variable LORA_BRIDGE_PORT."
+msgstr "串口以 ttyLORA 的名字出现在该目录中，例如 /dev/lora/ttyLORA，同时通过环境变量 LORA_BRIDGE_PORT 传入。"
+
+msgid "Network"
+msgstr "网络"
+
+msgid "Restart policy"
+msgstr "重启策略"
+
+msgid "no"
+msgstr "不重启"
+
+msgid "Privileged"
+msgstr "特权模式"
+
+msgid "Environment variables"
+msgstr "环境变量"
+
+msgid "Volumes"
+msgstr "卷"
+
+msgid "Published ports"
+msgstr "端口映射"
+
+msgid "Extra arguments"
+msgstr "额外参数"
+
+msgid "Appended to \"docker create\"."
+msgstr "追加到 \"docker create\" 的参数。"
+
+msgid "Stop timeout (seconds)"
+msgstr "停止超时（秒）"
+
+msgid "Status"
+msgstr "状态"
+
+msgid "Container started."
+msgstr "容器已启动。"
+
+msgid "Start container"
+msgstr "启动容器"
+
+msgid "Container stopped."
+msgstr "容器已停止。"
+
+msgid "Stop container"
+msgstr "停止容器"
+
+msgid "Container removed; it is created again when the device is present."
+msgstr "容器已删除；设备插入时会重新创建。"
+
+msgid "Recreate container"
+msgstr "重建容器"
+
