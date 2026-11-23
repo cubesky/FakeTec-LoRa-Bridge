@@ -69,6 +69,7 @@ const LABELS = {
   HB: '心跳 s', COMP: '压缩', PSM: '省电待机', SBHB: '待机心跳 s', USBACT: 'USB 激活 (1=插入 0=打开)',
   BLE: '蓝牙', NAME: '蓝牙名称', BLEPIN: '蓝牙固定配对码 (0=关)', BLEPAIR: '蓝牙允许方式 (1=按钮 2=数字比对 3=加密配对 0=开放)',
   OLED: '息屏时间 s (0=常亮)', OLEDTYPE: '屏幕 (0=SSD1306 1=SH1106)', FLIP: '屏幕翻转', BATCAL: '电池校准 x1000', OUT: '输出位',
+  FASTEN: '允许 2.4G 高速模式', FASTLOSS: '高速回退丢包门限 %', FASTRSSI: '高速回退 RSSI 门限 dBm', FASTPWR: '2.4G 发射功率 dBm',
 };
 const READONLY = new Set(['PEER']);
 
@@ -111,18 +112,65 @@ async function applyCfg() {
   await reloadCfg();
 }
 
+// ---- FAST mode (2.4 GHz high speed link) switch
+const FAST_WHY = {
+  'Bluetooth in use': '有一端正在使用蓝牙连接（高速模式与蓝牙互斥）',
+  'LoRa link not up': 'LoRa 链路未处于 LINK 状态', 'not paired': '尚未配对', 'no answer': '对端没有应答（固件低于 1.3.0？）',
+  'no 2.4G link': '2.4G 信号不通（距离太远？）', 'packet loss': '2.4G 丢包率过高', 'weak signal': '2.4G 信号太弱',
+  '2.4G link lost': '2.4G 链路中断', 'LoRa link down': 'LoRa 链路待机 / 断开', busy: '正在切换，请稍候', timeout: '超时',
+};
+const fastWhy = (r) => r.split(': ').map((x) => FAST_WHY[x] || (x === 'peer' ? '对端' : x === 'rejected' ? '对端拒绝' : x)).join('：');
+let fastState = null;    // last value from AT+ST: null = unknown / not supported
+let fastBusy = false;
+function showFast(v) {
+  fastState = v;
+  const b = $('#fast');
+  const ble = bridge.kind === 'ble';
+  b.disabled = !bridge.connected || fastBusy || v === null || (ble && v === 0);
+  b.classList.toggle('on', v === 2);
+  b.classList.toggle('neg', v === 1 || fastBusy);
+  b.textContent = fastBusy || v === 1 ? '2.4G 协商中…' : v === 2 ? '2.4G 高速：开' : '2.4G 高速';
+  b.title = v === null && bridge.connected ? '设备固件不支持高速模式（需要 1.3.0 或更新）'
+    : ble ? '通过蓝牙连接时不能使用高速模式（2.4G 射频与蓝牙互斥），请改用 USB 连接'
+    : '把数据切换到 2.4GHz 高速链路（AT+FAST），再点一次切回 LoRa';
+}
+$('#fast').addEventListener('click', async () => {
+  if (fastBusy || !bridge.connected) return;
+  const on = fastState !== 2;
+  fastBusy = true;
+  showFast(fastState);
+  try {
+    await bridge.setFast(on);
+    fastBusy = false;
+    showFast(on ? 2 : 0);
+  } catch (e) {
+    fastBusy = false;
+    showFast(0);
+    modal(on ? '未能进入 2.4G 高速模式' : '切回 LoRa 失败', [fastWhy(e.message), '数据继续通过 LoRa 传输。'], { error: true });
+  }
+  poll();
+});
+
 // ---- status bar
 async function poll() {
   if (!bridge.connected) return;
   try {
     const s = await bridge.status();
     if (!s) return;
+    if (!fastBusy) {
+      // the device fell back to LoRa by itself: say why (once)
+      if (fastState === 2 && s.fast === 0) {
+        bridge.fastStatus().then((f) => { if (f && f.reason && !/user/.test(f.reason)) modal('已自动切回 LoRa', [fastWhy(f.reason)], { autoClose: 4000 }); }).catch(() => {});
+      }
+      showFast(s.fast);
+    }
     const m = $('#mode');
     m.textContent = s.mode;
     m.className = 'badge ' + s.mode;
     const role = s.role === 'M' ? '主机' : s.role === 'S' ? '从机' : '';
     const peer = s.peerBatt <= 100 ? ` · 对端 <b>${s.peerBatt}%</b>` : '';
-    $('#stext').innerHTML = `${role} · <b>${s.freq.toFixed(3)}</b> MHz ch${s.channel} · RSSI <b>${s.rssi}</b> SNR <b>${s.snr}</b> · TX <b>${s.txRate}</b> RX <b>${s.rxRate}</b> B/s · Q <b>${s.queue}</b> · 电池 <b>${s.batt}%</b>${s.usb ? ' USB' : ''}${peer}`;
+    const fast = s.fast === 2 ? ` · <b>2.4G</b> RSSI <b>${s.fastRssi}</b>` : '';
+    $('#stext').innerHTML = `${role} · <b>${s.freq.toFixed(3)}</b> MHz ch${s.channel} · RSSI <b>${s.rssi}</b> SNR <b>${s.snr}</b>${fast} · TX <b>${s.txRate}</b> RX <b>${s.rxRate}</b> B/s · Q <b>${s.queue}</b> · 电池 <b>${s.batt}%</b>${s.usb ? ' USB' : ''}${peer}`;
   } catch (e) { /* next round */ }
 }
 
@@ -137,7 +185,8 @@ function setConnected(on) {
   bleBtn.disabled = busy || !navigator.bluetooth || (on && bridge.kind !== 'ble');
   clearInterval(pollTimer);
   if (on) { pollTimer = setInterval(poll, 2000); poll(); }
-  else { $('#mode').textContent = '----'; $('#mode').className = 'badge'; $('#stext').textContent = '未连接'; }
+  else { $('#mode').textContent = '----'; $('#mode').className = 'badge'; $('#stext').textContent = '未连接'; fastBusy = false; }
+  showFast(on ? fastState : null);
 }
 
 async function connect(dev) {

@@ -4,6 +4,7 @@
 #include "ble_svc.h"
 #include "config.h"
 #include "display.h"
+#include "fast.h"
 
 namespace display { const char* probeInfo(); }
 #include "lora_link.h"
@@ -186,6 +187,10 @@ static const IntParam kInts[] = {
     {"OLEDTYPE", &cfg.oledType, 'B', 0, 1, APPLY_REBOOT},
     {"FLIP", &cfg.oledFlip, 'B', 0, 1, APPLY_REBOOT},
     {"BATCAL", &cfg.battCalX1000, 'H', 500, 1500, APPLY_NONE},
+    {"FASTEN", &cfg.fastEnable, 'B', 0, 1, APPLY_NONE},
+    {"FASTLOSS", &cfg.fastLoss, 'B', 5, 90, APPLY_NONE},
+    {"FASTRSSI", &cfg.fastRssi, 'b', -100, -40, APPLY_NONE},
+    {"FASTPWR", &cfg.fastPower, 'b', -40, 8, APPLY_NONE},
 };
 
 static int32_t getInt(const IntParam& p) {
@@ -253,6 +258,8 @@ static void printCfg(Print& o) {
   o.printf("+COMP=%u\r\n", cfg.compress);
   o.printf("+PSM=%u\r\n+SBHB=%u\r\n+USBACT=%u\r\n+BLEPAIR=%u\r\n", cfg.powerSave, cfg.standbyHbS, cfg.usbActive,
            cfg.blePair);
+  o.printf("+FASTEN=%u\r\n+FASTLOSS=%u\r\n+FASTRSSI=%d\r\n+FASTPWR=%d\r\n", cfg.fastEnable, cfg.fastLoss, cfg.fastRssi,
+           cfg.fastPower);
 }
 
 static void printInfo(Print& o) {
@@ -272,6 +279,8 @@ static void printInfo(Print& o) {
   o.printf("Battery: %.2f V %u%% %s\r\n", battery::volts(), battery::percent(),
            battery::usbPowered() ? "(USB)" : "");
   o.printf("BLE: %s\r\n", ble::connected() ? "connected" : "idle");
+  if (fast::isUp()) o.printf("Data path: 2.4G FAST  %.0f MHz  RSSI %d  loss %u%%\r\n", fast::freqMHz(), fast::rssi(), fast::lossPct());
+  else o.printf("Data path: LoRa%s\r\n", fast::negotiating() ? " (FAST negotiating)" : "");
   o.printf("OLED: %s\r\n", display::info());
   if (g_resetReason & 0xA) printReset(o);
 }
@@ -290,6 +299,7 @@ static void printStats(Print& o) {
            (unsigned long)(s.txBytes ? s.txWire * 100 / s.txBytes : 100));
   o.printf("Hops %lu  syncs %lu  queue %u\r\n", (unsigned long)s.hops, (unsigned long)s.syncs,
            (unsigned)link::queued());
+  fast::stat(o);
 }
 
 static const char* HELP =
@@ -309,6 +319,11 @@ static const char* HELP =
     "AT+AFH=1 AT+LBT=1 AT+LBTRSSI=0               anti-interference\r\n"
     "AT+ENC=1 AT+ACK=1 AT+RETRY=4 AT+MAXPL=200 AT+PKTTO=20 AT+HB=3\r\n"
     "AT+COMP=1          compress data frames\r\n"
+    "AT+FAST=1 / 0      switch the data to the 2.4 GHz high speed link / back to LoRa\r\n"
+    "                   (negotiated over LoRa, no Bluetooth connection on either end,\r\n"
+    "                   falls back to LoRa by itself when the 2.4 GHz link is bad)\r\n"
+    "AT+FAST?           +FAST=0|1|2 (off, negotiating, on),state,RSSI,loss%,MHz,last reason\r\n"
+    "AT+FASTEN=1 AT+FASTLOSS=30 AT+FASTRSSI=-85 AT+FASTPWR=8  allow, fallback limits, 2.4G power\r\n"
     "AT+PSM=1 AT+SBHB=30 AT+USBACT=1              power save, standby heartbeat s, 1=USB plugged 0=port open\r\n"
     "AT+BLE=1 AT+NAME=xx AT+BLEPIN=0 AT+BLEPAIR=1 (reboot to apply)\r\n"
     "AT+BLEUNBOND       forget all paired phones\r\n"
@@ -374,6 +389,21 @@ void execute(const char* lineIn, Print& o, Port* port) {
   }
   if (!strcmp(name, "RSTAT")) {
     link::resetStats();
+    return ok(o);
+  }
+  if (!strcmp(name, "FAST")) {
+    if (query || !val) {
+      o.printf("+FAST=%u,%s,%d,%u,%.0f,%s\r\nOK\r\n", fast::isUp() ? 2 : (fast::state() != fast::OFF ? 1 : 0),
+               fast::stateName(), fast::rssi(), fast::lossPct(), fast::freqMHz(), fast::lastReason());
+      return;
+    }
+    if (atoi(val)) {
+      const char* why = fast::request();
+      if (why) return err(o, why);
+      o.print("OK (negotiating, check with AT+FAST?)\r\n");
+      return;
+    }
+    fast::release();
     return ok(o);
   }
   if (!strcmp(name, "PAIR")) {
@@ -527,12 +557,14 @@ void execute(const char* lineIn, Print& o, Port* port) {
   }
   if (!strcmp(name, "ST")) {
     // one machine-readable line for clients:
-    // mode,role,rssi,snr,batt%,usb,txRate,rxRate,peerBatt,queue,channel,freqMHz,peerRssi,peerSnr
+    // mode,role,rssi,snr,batt%,usb,txRate,rxRate,peerBatt,queue,channel,freqMHz,peerRssi,peerSnr,
+    // fast (0 = LoRa, 1 = negotiating 2.4G, 2 = data on 2.4G),fastRssi
     const LinkStats& s = link::stats();
-    o.printf("+ST=%s,%s,%d,%.1f,%u,%u,%lu,%lu,%u,%u,%u,%.3f,%d,%.1f\r\nOK\r\n", link::modeName(),
+    o.printf("+ST=%s,%s,%d,%.1f,%u,%u,%lu,%lu,%u,%u,%u,%.3f,%d,%.1f,%u,%d\r\nOK\r\n", link::modeName(),
              cfg.peerId ? (link::isMaster() ? "M" : "S") : "-", s.rssi, s.snr, battery::percent(),
              battery::usbPowered() ? 1 : 0, (unsigned long)s.txRate, (unsigned long)s.rxRate, s.remoteBatt,
-             (unsigned)link::queued(), link::channel(), link::freqMHz(), s.remoteRssi, s.remoteSnr);
+             (unsigned)link::queued(), link::channel(), link::freqMHz(), s.remoteRssi, s.remoteSnr,
+             fast::isUp() ? 2 : (fast::state() != fast::OFF ? 1 : 0), fast::isUp() ? fast::rssi() : 0);
     return;
   }
   if (!strcmp(name, "HANG")) {

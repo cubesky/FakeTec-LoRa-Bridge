@@ -36,6 +36,17 @@ class RingBuf {
     if (n > u) n = u;
     tail_ = (tail_ + n) % N;
   }
+  // Consumer side: put bytes back in front of the unread data (they are read again first).
+  size_t unread(const uint8_t* d, size_t n) {
+    size_t k = 0, t = tail_;
+    while (k < n && ((t + N - 1) % N) != head_) {
+      t = (t + N - 1) % N;
+      buf_[t] = d[n - 1 - k];
+      k++;
+    }
+    tail_ = t;
+    return k;
+  }
   size_t read(uint8_t* d, size_t n) {
     size_t r = peek(d, n);
     drop(r);

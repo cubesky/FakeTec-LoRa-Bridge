@@ -6,6 +6,7 @@
 #include "battery.h"
 #include "ble_svc.h"
 #include "config.h"
+#include "fast.h"
 #include "lora_link.h"
 #include "pins.h"
 
@@ -189,7 +190,10 @@ static void titleBar() {
   snprintf(buf, sizeof(buf), "%s%s%s%s", st, role, txAct ? ">" : " ", rxAct ? "<" : " ");
   oled->drawStr(1, 8, buf);
   int x = 52;
-  if (ble::connected()) oled->drawStr(x, 8, "BT");
+  // "F" = FAST mode, data on 2.4 GHz (blinks while it is being negotiated). Bluetooth is off
+  // the air meanwhile, so it takes the place of "BT".
+  if (fast::isUp() || (fast::negotiating() && (animFrame & 1))) oled->drawStr(x, 8, "F");
+  else if (ble::connected()) oled->drawStr(x, 8, "BT");
   x += 14;
   if (usbConnected()) oled->drawStr(x, 8, "U");
   x += 7;
@@ -207,7 +211,9 @@ static void titleBar() {
 //    | M |=>=>=>=>=| S |        right box = the peer
 //    '---'         '---'        between   = what the link is doing
 //
-//   LINK  arrows run in the direction data flows, a dot bounces when idle
+//   LINK  wire of "-": arrows run in the direction data flows ( ->-->-- ), a dot bounces when idle
+//   FAST  (LINK with the data on 2.4 GHz) "2.4G" above a wire of "=": double arrows that run
+//         twice as fast ( >>===>>== ), a star racing along the wire when idle
 //   STBY  z Z z            (both ends asleep, slow heartbeat)
 //   SRCH  ) ) ) )          (waking the peer)
 //   NOOP  blinking x, dotted peer box (peer not found)
@@ -223,8 +229,28 @@ static void pageArt() {
   bool ghost = false;  // peer unknown / missing: dotted box
   char l4[32], l5[32], a[12], b[12];
   snprintf(l5, sizeof(l5), "%.3fM SF%u BW%g", link::freqMHz(), cfg.sf, cfg.bwX10 / 10.0);
+  bool hs = fast::isUp() && !strcmp(mode, "LINK");
 
-  if (!strcmp(mode, "LINK")) {
+  if (hs) {
+    bool tx = s.txRate > 0, rx = s.rxRate > 0;
+    if (!tx && !rx) {  // idle: a star races along the double wire
+      memset(seg, '=', 9);
+      uint8_t p = (uint8_t)((f * 2) % 16);
+      seg[p > 8 ? 16 - p : p] = '*';
+    } else {
+      uint8_t ph = (uint8_t)((f * 2) % 5);  // two columns per frame
+      for (int i = 0; i < 9; i++) {
+        bool right = rx && tx ? i < 4 : tx;
+        if (rx && tx && i == 4) seg[i] = '|';
+        else if (right) seg[i] = ((i + 5 - ph) % 5 < 2) ? '>' : '=';
+        else seg[i] = ((i + ph) % 5 < 2) ? '<' : '=';
+      }
+    }
+    snprintf(l4, sizeof(l4), "2.4G %ddBm loss %u%%", fast::rssi(), fast::lossPct());
+    fmtRate(a, sizeof(a), s.txRate);
+    fmtRate(b, sizeof(b), s.rxRate);
+    snprintf(l5, sizeof(l5), "TX %-7s RX %s", a, b);
+  } else if (!strcmp(mode, "LINK")) {
     bool tx = s.txRate > 0 || millis() - link::txActivityMs() < 300;
     bool rx = s.rxRate > 0;
     if (s.txRate == 0 && s.rxRate == 0) {  // idle: a dot bounces along the wire
@@ -235,8 +261,8 @@ static void pageArt() {
       for (int i = 0; i < 9; i++) {
         bool right = rx && tx ? i < 4 : tx;  // both directions: left half out, right half in
         if (rx && tx && i == 4) seg[i] = '|';
-        else if (right) seg[i] = ((i + 300 - f) % 3 == 0) ? '>' : '=';
-        else seg[i] = ((i + f) % 3 == 0) ? '<' : '=';
+        else if (right) seg[i] = ((i + 3 - f % 3) % 3 == 0) ? '>' : '-';
+        else seg[i] = ((i + f) % 3 == 0) ? '<' : '-';
       }
     }
     if (s.rxFrames) snprintf(l4, sizeof(l4), "RSSI %d SNR %.1f", s.rssi, s.snr);
@@ -278,7 +304,7 @@ static void pageArt() {
   if (!link::radioOk()) snprintf(l4, sizeof(l4), "RADIO %s", link::radioStatus());
 
   char l[32];
-  snprintf(l, sizeof(l), " .---.         %s", ghost ? ". - ." : ".---.");
+  snprintf(l, sizeof(l), " .---.%s%s", hs ? ((f & 1) ? "  2.4G   " : " >2.4G<  ") : "         ", ghost ? ". - ." : ".---.");
   oled->drawStr(0, 21, l);
   snprintf(l, sizeof(l), " | %c |%s%c %c %c", me, seg, ghost ? ':' : '|', pe, ghost ? ':' : '|');
   oled->drawStr(0, 31, l);

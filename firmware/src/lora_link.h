@@ -60,5 +60,11 @@ const LinkStats& stats();
 void resetStats();
 void setLocalBattery(uint8_t pct);
 float channelFreqMHz(uint8_t ch);
+uint32_t random32();
+
+// ---- FAST mode (2.4 GHz bypass, see fast.h): the user data stream leaves / re-enters here
+size_t fastTake(uint8_t* buf, size_t max);       // next bytes to send; 0 while a LoRa data frame is still in flight
+void fastRequeue(const uint8_t* d, size_t n);    // bytes that did not make it: back to the front of the queue
+void fastDeliver(const uint8_t* d, size_t n);    // bytes received over 2.4 GHz
 
 }  // namespace link

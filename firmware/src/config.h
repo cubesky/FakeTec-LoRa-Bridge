@@ -2,7 +2,7 @@
 #include <Arduino.h>
 
 #define CFG_MAGIC   0x4C4F5241u  // "LORA"
-#define CFG_VERSION 3
+#define CFG_VERSION 4
 
 struct Config {
   uint32_t magic;
@@ -56,6 +56,12 @@ struct Config {
   uint8_t blePair;        // 1 = BLE needs pairing confirmed with the button
   uint16_t standbyHbS;    // heartbeat interval in standby
   uint8_t compress;       // LZ-compress data frames when it saves air time
+
+  // ---- added in v4: FAST mode (2.4 GHz link on the nRF52840 radio)
+  uint8_t fastEnable;     // 1 = AT+FAST may be used / accepted from the peer
+  uint8_t fastLoss;       // fall back to LoRa above this packet loss, %
+  int8_t fastRssi;        // ... or below this RSSI, dBm
+  int8_t fastPower;       // 2.4 GHz TX power, dBm (-40..8)
 
   uint32_t crc;
 };

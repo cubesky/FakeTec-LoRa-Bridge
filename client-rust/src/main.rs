@@ -71,6 +71,18 @@ enum Cmd {
     Dfu,
     /// Live link status
     Monitor,
+    /// FAST mode: move the data to the 2.4 GHz high speed link (`fast on`), back to LoRa
+    /// (`fast off`), or show its state (`fast`)
+    Fast {
+        #[arg(value_enum)]
+        mode: Option<OnOff>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+enum OnOff {
+    On,
+    Off,
 }
 
 // ------------------------------------------------------------------ control channel
@@ -219,6 +231,9 @@ struct Status {
     queue: u32,
     channel: u32,
     freq: f32,
+    /// FAST mode (firmware 1.3.0+): 0 = data on LoRa, 1 = negotiating, 2 = data on 2.4 GHz
+    fast: Option<u32>,
+    fast_rssi: i32,
 }
 
 fn parse_status(rsp: &str) -> Option<Status> {
@@ -240,7 +255,37 @@ fn parse_status(rsp: &str) -> Option<Status> {
         queue: f[9].parse().ok()?,
         channel: f[10].parse().ok()?,
         freq: f[11].parse().ok()?,
+        fast: f.get(14).and_then(|v| v.parse().ok()),
+        fast_rssi: f.get(15).and_then(|v| v.parse().ok()).unwrap_or(0),
     })
+}
+
+/// "+FAST=n,state,rssi,loss,MHz,reason" -> (n, reason)
+fn parse_fast(rsp: &str) -> Option<(u32, String)> {
+    let line = rsp.lines().find_map(|l| l.trim().strip_prefix("+FAST="))?;
+    let f: Vec<&str> = line.splitn(6, ',').collect();
+    Some((f.first()?.parse().ok()?, f.get(5).unwrap_or(&"").to_string()))
+}
+
+/// Switch FAST mode with `ask` (one AT command -> answer) and wait until the device has settled.
+/// Ok(true) = data on 2.4 GHz, Ok(false) = data on LoRa.
+fn fast_switch(ask: &mut dyn FnMut(&str) -> Result<String>, on: bool) -> Result<bool> {
+    let rsp = ask(if on { "AT+FAST=1" } else { "AT+FAST=0" })?;
+    if let Some(e) = rsp.lines().find(|l| l.starts_with("ERROR")) {
+        bail!("{}", e.trim_start_matches("ERROR").trim_start_matches(':').trim());
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        std::thread::sleep(Duration::from_millis(400));
+        let (n, reason) = parse_fast(&ask("AT+FAST?")?).ok_or_else(|| anyhow!("no FAST mode in this firmware (1.3.0 needed)"))?;
+        match (on, n) {
+            (true, 2) => return Ok(true),
+            (true, 0) => bail!("{}", if reason.is_empty() { "failed".into() } else { reason }),
+            (false, 0) => return Ok(false),
+            _ if Instant::now() > deadline => bail!("timeout"),
+            _ => {}
+        }
+    }
 }
 
 fn mode_styled(mode: &str) -> String {
@@ -260,10 +305,16 @@ fn status_line(s: &Status) -> String {
         _ => "-",
     };
     let peer = if s.peer_batt <= 100 { format!(" peer {}%", s.peer_batt) } else { String::new() };
+    let fast = match s.fast {
+        Some(2) => format!("  {} {} dBm", "FAST 2.4G".black().on_yellow(), s.fast_rssi),
+        Some(1) => format!("  {}", "FAST...".yellow()),
+        _ => String::new(),
+    };
     format!(
-        "{} {}  {} {:.3} MHz ch {}  {} {} dBm / {:.1} dB  {} {} B/s  {} {} B/s  {} {}  {} {}%{}{}",
+        "{} {}{}  {} {:.3} MHz ch {}  {} {} dBm / {:.1} dB  {} {} B/s  {} {} B/s  {} {}  {} {}%{}{}",
         mode_styled(&s.mode),
         role,
+        fast,
         "freq".dark_grey(),
         s.freq,
         s.channel,
@@ -375,14 +426,15 @@ enum Input {
 
 fn menu_help() -> String {
     format!(
-        "\r\n{} {}uit  {}tatus  {}ommand  {}air  {}nfo  s{}ttings  Ctrl-] send ^]  other: back\r\n",
+        "\r\n{} {}uit  {}tatus  {}ommand  {}air  {}nfo  s{}ttings  {}ast 2.4G on/off  Ctrl-] send ^]  other: back\r\n",
         "[lbridge]".black().on_cyan(),
         "q".yellow().bold(),
         "s".yellow().bold(),
         "c".yellow().bold(),
         "p".yellow().bold(),
         "i".yellow().bold(),
-        "e".yellow().bold()
+        "e".yellow().bold(),
+        "f".yellow().bold()
     )
 }
 
@@ -467,9 +519,14 @@ fn term(dev: Dev, no_title: bool, echo: bool) -> Result<()> {
         if !no_title && matches!(state, Input::Pass) && Instant::now() >= next_poll {
             next_poll = Instant::now() + Duration::from_secs(2);
             if let Some(s) = ask("AT+ST").ok().and_then(|r| parse_status(&r)) {
+                let fast = match s.fast {
+                    Some(2) => " FAST 2.4G",
+                    Some(1) => " FAST...",
+                    _ => "",
+                };
                 put(format!(
-                    "\x1b]0;lbridge {} | {} {} | RSSI {} SNR {:.1} | TX {} RX {} B/s | bat {}%\x07",
-                    name, s.mode, s.role, s.rssi, s.snr, s.tx_rate, s.rx_rate, s.batt
+                    "\x1b]0;lbridge {} | {} {}{} | RSSI {} SNR {:.1} | TX {} RX {} B/s | bat {}%\x07",
+                    name, s.mode, s.role, fast, s.rssi, s.snr, s.tx_rate, s.rx_rate, s.batt
                 )
                 .as_bytes());
             }
@@ -509,6 +566,19 @@ fn term(dev: Dev, no_title: bool, echo: bool) -> Result<()> {
                         b'i' | b'I' => show("ATI"),
                         b'e' | b'E' => show("AT+CFG"),
                         b'p' | b'P' => show("AT+PAIR"),
+                        b'f' | b'F' => {
+                            // toggle: on 2.4 GHz (or negotiating) -> back to LoRa, else -> 2.4 GHz
+                            let on = !matches!(ask("AT+FAST?").ok().and_then(|r| parse_fast(&r)), Some((1 | 2, _)));
+                            put(if on { b"FAST: negotiating 2.4G...\r\n".as_slice() } else { b"FAST: back to LoRa...\r\n".as_slice() });
+                            let mut a = |l: &str| ask(l);
+                            let msg = match fast_switch(&mut a, on) {
+                                Ok(true) => "FAST: data on 2.4G".green().to_string(),
+                                Ok(false) => "FAST: data on LoRa".green().to_string(),
+                                Err(e) => format!("FAST: {e} - data stays on LoRa").red().to_string(),
+                            };
+                            put(format!("{msg}\r\n").as_bytes());
+                            next_poll = Instant::now();
+                        }
                         b'c' | b'C' => {
                             put(format!("{} ", "AT>".cyan().bold()).as_bytes());
                             state = Input::Line(String::new());
@@ -632,6 +702,16 @@ fn run(cli: Cli) -> Result<()> {
                 Cmd::Reboot => run_cmd(&mut dev, "AT+REBOOT"),
                 Cmd::Dfu => run_cmd(&mut dev, "AT+DFU"),
                 Cmd::Monitor => monitor(&mut dev),
+                Cmd::Fast { mode: None } => run_cmd(&mut dev, "AT+FAST?"),
+                Cmd::Fast { mode: Some(m) } => {
+                    let mut a = |l: &str| dev.cmd(l);
+                    match fast_switch(&mut a, *m == OnOff::On) {
+                        Ok(true) => println!("{}", "data on 2.4G (FAST)".green()),
+                        Ok(false) => println!("{}", "data on LoRa".green()),
+                        Err(e) => bail!("FAST mode: {e} - data stays on LoRa"),
+                    }
+                    run_cmd(&mut dev, "AT+FAST?")
+                }
                 Cmd::List | Cmd::Term { .. } => unreachable!(),
             }
         }

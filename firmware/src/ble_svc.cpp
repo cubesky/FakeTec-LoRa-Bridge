@@ -497,4 +497,14 @@ void disconnect() {
   if (connected()) Bluefruit.disconnect(connHandle);
 }
 
+// Every advertisement takes the radio away from the 2.4 GHz link for ~10 ms, and a central
+// that connects ends FAST mode anyway: Bluetooth stays off the air while FAST mode runs.
+void pauseAdv(bool on) {
+  static bool cur = false;
+  if (on == cur || !cfg.bleEnable) return;
+  cur = on;
+  if (on) Bluefruit.Advertising.stop();
+  else if (!connected()) Bluefruit.Advertising.start(0);
+}
+
 }  // namespace ble

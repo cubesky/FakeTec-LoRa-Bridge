@@ -16,6 +16,7 @@
 #include "ble_svc.h"
 #include "config.h"
 #include "display.h"
+#include "fast.h"
 #include "lora_link.h"
 #include "pins.h"
 #include "ringbuf.h"
@@ -58,6 +59,15 @@ static bool usbActive() {
   return (bool)Serial;
 }
 bool anyCmdMode() { return usbPort.cmdMode || blePort.cmdMode || webPort.cmdMode; }
+// Room in the output buffers of the ports that are taking data. The 2.4 GHz link only accepts
+// what fits (the peer repeats the rest), so nothing is dropped at its much higher speed.
+size_t serialOutSpace() {
+  size_t s = 4095;
+  if (usbConnected() && !usbPort.cmdMode && usbOut.space() < s) s = usbOut.space();
+  if (ble::uartReady() && !blePort.cmdMode && bleOut.space() < s) s = bleOut.space();
+  if (webConnected() && !webPort.cmdMode && webOut.space() < s) s = webOut.space();
+  return s;
+}
 
 void applyOutputs() {
   digitalWrite(PIN_T1G, (cfg.outputs & 1) ? HIGH : LOW);
@@ -124,7 +134,7 @@ static void usbTask() {
     usbPort.esc = 0;
     display::wake();
   }
-  uint8_t in[64], out[64 + 8];
+  static uint8_t in[256], out[256 + 8];  // (static: the loop task's stack is small)
 
   if (usbPort.cmdMode) {
     int a = Serial.available();
@@ -174,7 +184,7 @@ static void webTask() {
     webPort.oscBody = false;
     display::wake();
   }
-  uint8_t in[64], out[64 + 8];
+  static uint8_t in[256], out[256 + 8];
   int a = usbWeb.available();
   if (webPort.cmdMode) {
     if (a > 0) {
@@ -202,9 +212,11 @@ static void webTask() {
       size_t n = webOut.peek(buf, w < sizeof(buf) ? w : sizeof(buf));
       size_t done = usbWeb.write(buf, n);
       webOut.drop(done);
-      usbWeb.flush();
     }
   }
+  // Also pushes out command responses: a partly filled packet (anything shorter than 64 bytes,
+  // e.g. "OK") otherwise stays in the endpoint FIFO until later output fills it up.
+  if (conn) usbWeb.flush();
 }
 
 // ------------------------------------------------------------------ BLE UART port
@@ -386,6 +398,7 @@ void loop() {
   link::setActive(usbActive() || ble::connected());
   stage(5);
   link::loop();
+  fast::loop();
 
   stage(6);
   buttonTask();
@@ -401,7 +414,7 @@ void loop() {
     else NVIC_SystemReset();
   }
 
-  if (millis() == t && usbOut.empty() && bleOut.empty() && webOut.empty() && link::queued() == 0) {
+  if (millis() == t && usbOut.empty() && bleOut.empty() && webOut.empty() && link::queued() == 0 && !fast::busy()) {
     // standby: nothing is time critical, let the CPU sleep longer
     delay(link::isConn() ? 1 : 20);
   }

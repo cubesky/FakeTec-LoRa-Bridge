@@ -34,6 +34,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     }
     console.log('B received A intact:', got.b === msgA, JSON.stringify(got.b));
     console.log('A received B intact:', got.a === msgB, JSON.stringify(got.a));
+    // FAST mode (firmware 1.3.0+): to 2.4 GHz and back
+    if ((await a.status()).fast !== null) {
+      try {
+        console.log('FAST on:', JSON.stringify(await a.setFast(true)), ' status.fast A/B:', (await a.status()).fast, (await b.status()).fast);
+        console.log('FAST off:', JSON.stringify(await a.setFast(false)));
+      } catch (e) { console.log('FAST failed:', e.message); }
+    }
     await b.close();
   }
   await a.close();

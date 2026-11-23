@@ -29,5 +29,6 @@ void diag(Print& out);     // connection counters, last disconnect reason / pair
 
 void setBattery(uint8_t pct);
 void disconnect();
+void pauseAdv(bool on);    // FAST mode: no advertising, the 2.4 GHz link has the radio to itself
 
 }  // namespace ble

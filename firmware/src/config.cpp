@@ -3,6 +3,8 @@
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
 
+#include "rf24.h"
+
 using namespace Adafruit_LittleFS_Namespace;
 
 static const char* CFG_PATH = "/lorabridge.cfg";
@@ -80,14 +82,33 @@ void configDefaults(Config& c) {
   c.blePair = 1;
   c.standbyHbS = 30;
   c.compress = 1;
+
+  c.fastEnable = 1;
+  c.fastLoss = 30;
+  c.fastRssi = -85;
+  c.fastPower = 8;
 }
 
-// v2 files: identical layout up to "outputs", then the CRC
+// Older files have the identical layout up to their last field, followed by the CRC:
+// v2 ends with "outputs", v3 with "compress".
 #define CFG_V2_BODY (offsetof(Config, outputs) + 1)
-#define CFG_V2_CRC_OFS ((CFG_V2_BODY + 3) & ~3u)
-#define CFG_V2_SIZE (CFG_V2_CRC_OFS + 4)
+#define CFG_V3_BODY (offsetof(Config, compress) + 1)
 
 bool configSave();
+// keeps pairing + settings, the fields the old version did not have stay at their defaults
+static bool loadOld(const Config& tmp, size_t n, uint16_t version, size_t body) {
+  size_t crcOfs = (body + 3) & ~(size_t)3, size = crcOfs + 4;
+  if (n != size || tmp.version != version || tmp.size != size) return false;
+  uint32_t crc;
+  memcpy(&crc, (const uint8_t*)&tmp + crcOfs, 4);
+  if (crc != crc32(&tmp, crcOfs)) return false;
+  memcpy(&cfg, &tmp, body);
+  cfg.version = CFG_VERSION;
+  cfg.size = sizeof(Config);
+  cfg.bleName[sizeof(cfg.bleName) - 1] = 0;
+  configSave();
+  return true;
+}
 void configLoad() {
   g_nodeId = NRF_FICR->DEVICEID[0] ^ (NRF_FICR->DEVICEID[1] * 2654435761u);
   if (g_nodeId == 0 || g_nodeId == 0xFFFFFFFFu) g_nodeId = 0x13572468u;
@@ -104,16 +125,8 @@ void configLoad() {
       tmp.size == sizeof(Config) && tmp.crc == crc32(&tmp, offsetof(Config, crc))) {
     cfg = tmp;
     cfg.bleName[sizeof(cfg.bleName) - 1] = 0;
-  } else if (n == CFG_V2_SIZE && tmp.magic == CFG_MAGIC && tmp.version == 2 && tmp.size == CFG_V2_SIZE) {
-    uint32_t crc;
-    memcpy(&crc, (const uint8_t*)&tmp + CFG_V2_CRC_OFS, 4);
-    if (crc == crc32(&tmp, CFG_V2_CRC_OFS)) {
-      memcpy(&cfg, &tmp, CFG_V2_BODY);  // keeps pairing + settings, new fields stay at defaults
-      cfg.version = CFG_VERSION;
-      cfg.size = sizeof(Config);
-      cfg.bleName[sizeof(cfg.bleName) - 1] = 0;
-      configSave();
-    }
+  } else if (tmp.magic == CFG_MAGIC) {
+    if (!loadOld(tmp, n, 3, CFG_V3_BODY)) loadOld(tmp, n, 2, CFG_V2_BODY);
   }
 }
 
@@ -122,10 +135,15 @@ bool configSave() {
   cfg.version = CFG_VERSION;
   cfg.size = sizeof(Config);
   cfg.crc = crc32(&cfg, offsetof(Config, crc));
+  // flash operations need the radio to be idle: FAST mode lets go of its timeslots meanwhile
+  rf24::pause(true);
   InternalFS.remove(CFG_PATH);
   File f(InternalFS);
-  if (!f.open(CFG_PATH, FILE_O_WRITE)) return false;
-  size_t n = f.write((const uint8_t*)&cfg, sizeof(cfg));
-  f.close();
+  size_t n = 0;
+  if (f.open(CFG_PATH, FILE_O_WRITE)) {
+    n = f.write((const uint8_t*)&cfg, sizeof(cfg));
+    f.close();
+  }
+  rf24::pause(false);
   return n == sizeof(cfg);
 }

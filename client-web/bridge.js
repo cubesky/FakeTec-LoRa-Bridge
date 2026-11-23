@@ -229,14 +229,40 @@
       return p;
     }
 
-    // +ST=mode,role,rssi,snr,batt,usb,txRate,rxRate,peerBatt,queue,channel,freq,peerRssi,peerSnr
+    // +ST=mode,role,rssi,snr,batt,usb,txRate,rxRate,peerBatt,queue,channel,freq,peerRssi,peerSnr,fast,fastRssi
+    // fast (firmware 1.3.0+): 0 = data on LoRa, 1 = negotiating 2.4 GHz, 2 = data on 2.4 GHz; null = not supported
     async status() {
       const r = await this.cmd('AT+ST');
       const m = r.match(/\+ST=(.*)/);
       if (!m) return null;
       const f = m[1].trim().split(',');
       return { mode: f[0], role: f[1], rssi: +f[2], snr: +f[3], batt: +f[4], usb: f[5] === '1', txRate: +f[6], rxRate: +f[7],
-               peerBatt: +f[8], queue: +f[9], channel: +f[10], freq: +f[11], peerRssi: +f[12], peerSnr: +f[13] };
+               peerBatt: +f[8], queue: +f[9], channel: +f[10], freq: +f[11], peerRssi: +f[12], peerSnr: +f[13],
+               fast: f.length > 14 ? +f[14] : null, fastRssi: f.length > 15 ? +f[15] : 0 };
+    }
+
+    // FAST mode (2.4 GHz high speed link). +FAST=n,state,rssi,loss%,MHz,last reason
+    async fastStatus() {
+      const m = (await this.cmd('AT+FAST?')).match(/\+FAST=(.*)/);
+      if (!m) return null;
+      const f = m[1].trim().split(',');
+      return { fast: +f[0], state: f[1], rssi: +f[2], loss: +f[3], freq: +f[4], reason: f.slice(5).join(',') };
+    }
+    // Switch the data to 2.4 GHz (on) or back to LoRa. Resolves with fastStatus() once the
+    // device has settled; rejects with the device's reason when it refuses or the negotiation fails.
+    async setFast(on, timeoutMs = 20000) {
+      const r = await this.cmd(on ? 'AT+FAST=1' : 'AT+FAST=0');
+      const err = r.match(/ERROR:?\s*(.*)/);
+      if (err) throw new Error(err[1] || 'ERROR');
+      const end = Date.now() + timeoutMs;
+      for (;;) {
+        await new Promise((res) => setTimeout(res, 400));
+        const s = await this.fastStatus();
+        if (!s) throw new Error('no FAST mode in this firmware');
+        if (on && s.fast === 2) return s;
+        if (s.fast === 0) { if (on) throw new Error(s.reason || 'failed'); return s; }
+        if (Date.now() > end) throw new Error('timeout');
+      }
     }
 
     // { KEY: 'value', ... } from AT+CFG

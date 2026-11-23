@@ -21,6 +21,8 @@
   .badge.LINK { background:#1f7a3a; color:#fff; } .badge.STBY { background:#1d5f8a; color:#fff; }
   .badge.NOOP { background:#9b2c2c; color:#fff; } .badge.UNPR { background:#7a3f9b; color:#fff; }
   .badge.SRCH,.badge.PAIR { background:#9a6b00; color:#fff; }
+  #fast.on { background:#d9a400; border-color:#d9a400; color:#201800; font-weight:600; }
+  #fast.neg { border-color:#d9a400; color:#d9a400; }
   #status { display:flex; gap:14px; align-items:center; color:var(--dim); font-family:ui-monospace,Consolas,monospace; font-size:13px; flex-wrap:wrap; }
   #status b { color:var(--fg); font-weight:600; }
   main { flex:1; display:flex; min-height:0; }
@@ -62,6 +64,7 @@
   <h1>LoRa Bridge</h1>
   <button id="connect" class="primary">USB 连接</button>
   <button id="connectble" class="primary">蓝牙连接</button>
+  <button id="fast" disabled title="把数据切换到 2.4GHz 高速链路（AT+FAST），再点一次切回 LoRa">2.4G 高速</button>
   <div id="status"><span class="badge" id="mode">----</span><span id="stext">未连接</span></div>
 </header>
 <div id="nousb">此浏览器不支持 WebUSB 和 Web Bluetooth。请使用 Chrome / Edge（桌面版或 Android），并通过 https 或 http://localhost 打开本页面。</div>

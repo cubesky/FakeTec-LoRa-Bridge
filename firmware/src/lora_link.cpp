@@ -16,6 +16,7 @@
 #include <nrf_soc.h>
 
 #include "config.h"
+#include "fast.h"
 #include "lz.h"
 #include "pins.h"
 #include "ringbuf.h"
@@ -50,6 +51,7 @@ enum : uint8_t {
   FT_SYNC_ACK = 5,
   FT_PAIR_REQ = 6,
   FT_PAIR_ACK = 7,
+  FT_FAST = 8,  // FAST mode (2.4 GHz) negotiation, see fast.cpp
 };
 #define FL_ENC 0x01
 #define FL_ACKREQ 0x02
@@ -99,6 +101,7 @@ static RadioMode mode = RM_OFF;
 static bool radioReady = false;
 static char radioMsg[48] = "init";
 static uint32_t txStartMs = 0, txTimeoutMs = 0, lastTxMs = 0, lastRxMs = 0;
+static uint32_t fastTxMs = 0, fastRxMs = 0;  // activity on the 2.4 GHz bypass
 static uint8_t txType = 0;
 static bool txNeedsAck = false;
 
@@ -361,7 +364,8 @@ static bool sendFrame(uint8_t type, uint8_t flags, uint32_t dst, uint16_t seq, c
   Hdr h;
   h.magicType = FRAME_MAGIC | type;
   // a sleeping (duty-cycled) peer only hears frames with the long wake-up preamble
-  bool lng = psm() && !peerAwake && dst == cfg.peerId && (type == FT_PING || type == FT_SYNC || type == FT_DATA);
+  bool lng = psm() && !peerAwake && dst == cfg.peerId &&
+             (type == FT_PING || type == FT_SYNC || type == FT_DATA || type == FT_FAST);
   if (localActive) flags |= FL_ACTIVE;
   if (conn) flags |= FL_AWAKE;
   if (lng) flags |= FL_LONGPRE;
@@ -602,6 +606,10 @@ static void handleRx() {
         forcePing = true;
       }
       break;
+    case FT_FAST:
+      if (h.flags & FL_ENC) aesCtr(pl, plen, h);
+      fast::onCtl(pl, plen);
+      break;
   }
 }
 
@@ -668,7 +676,11 @@ const char* modeName() {
 }
 bool isConn() { return conn; }
 bool powerSave() { return psm(); }
-size_t queueSpace() { return txRing.space(); }
+size_t queueSpace() {
+  // FAST mode: keep room for the bytes that may come back from the 2.4 GHz queue
+  size_t s = txRing.space(), r = fast::state() != fast::OFF ? 2048 : 0;
+  return s > r ? s - r : 0;
+}
 size_t queued() { return txRing.used() + (pendValid ? pendRaw : 0); }
 size_t queue(const uint8_t* d, size_t n) {
   size_t w = txRing.write(d, n);
@@ -714,8 +726,29 @@ uint16_t channelMask() { return activeMask; }
 float freqMHz() { return channelFreqMHz(curCh); }
 uint32_t dwellMs() { return dwell; }
 uint32_t lastHeardAgoMs() { return lastHeard ? millis() - lastHeard : 0xFFFFFFFFu; }
-uint32_t txActivityMs() { return lastTxMs; }
-uint32_t rxActivityMs() { return lastRxMs; }
+uint32_t txActivityMs() { return (int32_t)(fastTxMs - lastTxMs) > 0 ? fastTxMs : lastTxMs; }
+uint32_t rxActivityMs() { return (int32_t)(fastRxMs - lastRxMs) > 0 ? fastRxMs : lastRxMs; }
+uint32_t random32() { return rnd32(); }
+
+size_t fastTake(uint8_t* buf, size_t max) {
+  if (pendValid || waitingAck || txRing.empty()) return 0;  // LoRa first finishes what it started
+  size_t n = txRing.read(buf, max);
+  st.txBytes += n;
+  st.txWire += n;
+  fastTxMs = millis();
+  return n;
+}
+void fastRequeue(const uint8_t* d, size_t n) {
+  size_t k = txRing.unread(d, n);
+  st.txBytes -= k;
+  st.txWire -= k;
+  lastQueueIn = millis();
+}
+void fastDeliver(const uint8_t* d, size_t n) {
+  st.rxBytes += n;
+  fastRxMs = millis();
+  if (rxHandler && n) rxHandler(d, n);
+}
 const LinkStats& stats() { return st; }
 void resetStats() {
   LinkStats z;
@@ -827,6 +860,7 @@ bool begin() {
 // ---------------------------------------------------------------- main loop
 static void maybeBuildDataFrame(uint32_t now) {
   if (pendValid || txRing.empty()) return;
+  if (fast::holdData()) return;  // the data goes over 2.4 GHz / the switch back is being settled
   size_t maxp = cfg.maxPayload ? cfg.maxPayload : 1;
   if (maxp > MAX_PAYLOAD) maxp = MAX_PAYLOAD;
   if (txRing.used() < maxp && now - lastQueueIn < cfg.packTimeoutMs) return;
@@ -957,6 +991,25 @@ static void scheduler(uint32_t now) {
     return;  // hold data until the hop clock is synchronised
   }
 
+  // 6b. FAST mode control frames
+  if (paired()) {
+    static uint8_t ctl[24];
+    static size_t ctlLen = 0;
+    static uint16_t ctlSeq = 0;
+    if (!ctlLen) ctlLen = fast::ctlPoll(ctl, sizeof(ctl));
+    if (ctlLen) {
+      if (hop) {
+        uint32_t pos = hopClock() % dwell;
+        if (pos < SLOT_GUARD_MS || dwell - pos < toaMs(HDR_LEN + ctlLen) + SLOT_GUARD_MS) return;
+      }
+      if (channelBusy()) return;
+      size_t n = ctlLen;
+      ctlLen = 0;
+      sendFrame(FT_FAST, (cfg.encrypt && !keyIsZero()) ? FL_ENC : 0, cfg.peerId, ++ctlSeq, ctl, n);
+      return;
+    }
+  }
+
   // 7. data
   maybeBuildDataFrame(now);
   if (pendValid && (int32_t)(now - nextTxAt) >= 0) {
@@ -1071,7 +1124,8 @@ void loop() {
   if (now - rateT >= 1000) {
     uint32_t dt = now - rateT;
     rateT = now;
-    st.txRate = (st.txBytes - rateTx0) * 1000 / dt;
+    int32_t dTx = (int32_t)(st.txBytes - rateTx0);  // can go backwards when FAST mode hands bytes back
+    st.txRate = dTx > 0 ? (uint32_t)dTx * 1000 / dt : 0;
     st.rxRate = (st.rxBytes - rateRx0) * 1000 / dt;
     rateTx0 = st.txBytes;
     rateRx0 = st.rxBytes;

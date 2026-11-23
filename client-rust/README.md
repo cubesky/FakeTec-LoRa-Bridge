@@ -24,7 +24,7 @@ lbridge -p COM3 term --echo
 - Ctrl-C、Ctrl-Z、方向键、功能键等控制键和转义序列原样发往远端（Windows 下自动启用 VT 输入 / 输出）；
 - 窗口标题每 2 秒显示链路状态、信号和速率（`--no-title` 关闭）。
 
-`Ctrl-]` 打开本地菜单：`q` 退出，`s` 状态，`i` 设备信息，`e` 全部设置，`p` 配对，`c` 输入一条命令（如 `freq 434.5` 或 `AT+SF=9`），再按一次 `Ctrl-]` 把该键发给远端。
+`Ctrl-]` 打开本地菜单：`q` 退出，`s` 状态，`i` 设备信息，`e` 全部设置，`p` 配对，`f` 切换 2.4G 高速模式（FAST，开 / 关），`c` 输入一条命令（如 `freq 434.5` 或 `AT+SF=9`），再按一次 `Ctrl-]` 把该键发给远端。高速模式启用时窗口标题和状态行显示 `FAST 2.4G`。
 
 ## 配置
 
@@ -39,6 +39,9 @@ lbridge at AT+HOPCH=16       # 任意 AT 命令
 lbridge pair                 # 两端各执行一次
 lbridge unpair | reboot | dfu
 lbridge monitor              # 实时状态行
+lbridge fast on              # 协商切换到 2.4GHz 高速模式（固件 1.3.0+），等待结果；失败时给出原因
+lbridge fast off             # 切回 LoRa
+lbridge fast                 # 查询高速模式状态
 ```
 
 配置命令使用设备的带内控制通道（`ESC ] L B ; <AT 命令> BEL`），终端运行期间也可以用，不会混入串口数据，也不需要 `+++`。
