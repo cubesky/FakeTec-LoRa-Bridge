@@ -80,7 +80,7 @@ void configDefaults(Config& c) {
   c.powerSave = 1;
   c.usbActive = 1;
   c.blePair = 1;
-  c.standbyHbS = 30;
+  c.standbyHbS = 60;
   c.compress = 1;
 
   c.fastEnable = 1;

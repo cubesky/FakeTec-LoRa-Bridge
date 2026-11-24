@@ -189,10 +189,12 @@ static bool powered = false;
 enum : uint8_t { LS_REPLY, LS_SLOT };
 static bool listening = false, replyPending = false, hbExpectReply = false, txShort = false, txListen = false;
 static bool hbSync = false, slotSync = false;
+static bool hbRetry = false;                   // master: one quick retry after an unanswered heartbeat
+static uint32_t hbRetryAt = 0;
 static uint8_t listenKind = LS_REPLY, hbMiss = 0, slotMiss = 0;
 static uint32_t listenUntil = 0, replyAt = 0, replyWinMs = 120;
 static uint32_t nextHb = 0;                    // master: next scheduled heartbeat
-static uint32_t slotAt = 0, slotHbMs = 30000;  // slave: expected TX start of the master's next heartbeat, its interval
+static uint32_t slotAt = 0, slotHbMs = 60000;  // slave: expected TX start of the master's next heartbeat, its interval
 static uint32_t fallbackAt = 0, annAt = 0;     // slave: own heartbeat if the master stays silent; next announcement
 static uint32_t idleSince = 0, connSince = 0, activeSince = 0;
 static uint16_t wakePre = 64;      // wake-up preamble length in symbols
@@ -335,11 +337,12 @@ static bool paired() { return cfg.peerId != 0 && cfg.peerId != BCAST; }
 bool isMaster() { return paired() && g_nodeId < cfg.peerId; }
 static bool psm() { return paired() && cfg.powerSave; }
 static bool standbyAnnounce(uint32_t now) { return localActive && now - activeSince < ACTIVE_ANNOUNCE_MS; }
-static uint32_t standbyHbMs() { return (cfg.standbyHbS ? cfg.standbyHbS : 30) * 1000u; }
+static uint32_t standbyHbMs() { return (cfg.standbyHbS ? cfg.standbyHbS : 60) * 1000u; }
 static uint32_t slotWinMs() { return 40 + slotHbMs / 10000; }  // loop latency + 100 ppm clock error
 static void standbyScheduleReset(uint32_t now) {
-  hbSync = slotSync = false;
+  hbSync = slotSync = hbRetry = false;
   hbMiss = slotMiss = 0;
+  st.sbReset++;
   listening = replyPending = hbExpectReply = false;
   nextHb = now + standbyHbMs();
   fallbackAt = now + standbyHbMs() * 3 / 2 + rndRange(2000);
@@ -359,7 +362,8 @@ float channelFreqMHz(uint8_t ch) {
 }
 
 static uint32_t linkTimeoutMs() {
-  if (psm() && !conn) return (cfg.standbyHbS ? cfg.standbyHbS : 30) * 3000u + 5000;
+  // standby: two heartbeat intervals (each unanswered heartbeat is retried once right away)
+  if (psm() && !conn) return standbyHbMs() * 2 + 5000;
   uint32_t hb = (cfg.heartbeatS ? cfg.heartbeatS : 3) * 1000u;
   uint32_t t = hb * 3 + 2 * (hopActive() ? dwell : 0) + 2000;
   return t;
@@ -536,6 +540,8 @@ static bool sendFrame(uint8_t type, uint8_t flags, uint32_t dst, uint16_t seq, c
   txStartMs = lastTxMs = millis();
   txTimeoutMs = toaMs(HDR_LEN + plen) * 2 + 200;  // (toaMs already includes the long preamble)
   st.txFrames++;
+  if (lng) st.txLong++;
+  st.txAirMs += toaMs(HDR_LEN + plen);
   return true;
 }
 
@@ -577,7 +583,7 @@ static void powerUpdate(uint32_t now) {
     nextSyncBeacon = now;
     forcePing = true;
     waitingAck = false;
-    listening = replyPending = hbExpectReply = false;
+    listening = replyPending = hbExpectReply = hbRetry = false;
     if (mode == RM_RX) {
       radio.standby();
       startRx();  // receiver continuously on from now
@@ -750,6 +756,7 @@ static void handleRx() {
             // the master's scheduled heartbeat: the next one comes one interval after this one started
             if (plen >= 12) slotHbMs = (uint32_t)(pl[10] | (pl[11] << 8)) * 1000u;
             uint32_t toa = toaMs(len) + ((h.flags & FL_LONGPRE) ? wakeExtraMs : 0);
+            if (slotSync) st.sbSlotErr = (int16_t)(int32_t)(rxDoneMs - toa - slotAt);
             slotAt = rxDoneMs - toa + slotHbMs;
             slotSync = slotHbMs >= 5000;
             slotMiss = 0;
@@ -879,7 +886,7 @@ void waitIrq(uint32_t ms) {
     uint32_t t = 0;
     bool have = false;
     if (replyPending) t = replyAt, have = true;
-    else if (isMaster()) t = nextHb, have = true;
+    else if (isMaster()) t = (hbRetry && (int32_t)(hbRetryAt - nextHb) < 0) ? hbRetryAt : nextHb, have = true;
     else if (slotSync && !listening) t = slotAt - slotWinMs(), have = true;
     if (have) {
       int32_t d = (int32_t)(t - now);
@@ -1339,7 +1346,14 @@ static void scheduler(uint32_t now) {
         forcePing = false;
         annAt = now + 4000;
         sendPing(FL_LISTEN);
+      } else if (isMaster() && hbRetry && (int32_t)(now - hbRetryAt) >= 0) {
+        // the last heartbeat (or its answer) got lost: once more, long preamble - the slave may
+        // have missed its slot. Not a scheduled one: the slave keeps its slot.
+        hbRetry = false;
+        st.sbRetry++;
+        sendPing(FL_LISTEN);
       } else if (isMaster() && (int32_t)(now - nextHb) >= 0) {
+        hbRetry = false;
         uint32_t hb = standbyHbMs();
         nextHb += hb;  // fixed cadence: the slave listens at exactly these moments
         if ((int32_t)(now - nextHb) >= 0) nextHb = now + hb;  // fell behind: new schedule (slave resyncs)
@@ -1347,6 +1361,7 @@ static void scheduler(uint32_t now) {
       } else if (!isMaster() && (int32_t)(now - fallbackAt) >= 0) {
         // nothing scheduled from the master for 1.5 intervals: own heartbeat, long preamble
         fallbackAt = now + standbyHbMs() * 3 / 2 + rndRange(2000);
+        st.sbFallback++;
         sendPing(FL_LISTEN);
       }
       return;
@@ -1420,6 +1435,7 @@ void loop() {
     uint32_t w = slotWinMs();
     if ((int32_t)(now - (slotAt + w)) > 0) {  // window passed while we were busy (sending)
       slotAt += slotHbMs;
+      st.sbSlotMiss++;
       if (++slotMiss >= 2) slotSync = false;
     } else if ((int32_t)(now - (slotAt - w)) >= 0) {
       listening = true;
@@ -1440,10 +1456,17 @@ void loop() {
     if (!(hdr || pre) || now - listenUntil > (hdr ? toaMaxMs + 100 : hdrWaitMs)) {
       listening = false;
       // no answer to a scheduled heartbeat twice: the slave has lost the schedule, long preamble again
-      if (listenKind == LS_REPLY && hbExpectReply && ++hbMiss >= 2) hbSync = false;
+      if (listenKind == LS_REPLY && hbExpectReply) {
+        st.sbHbMiss++;
+        if (++hbMiss >= 2) hbSync = false;
+        // retry soon - but only while the peer was heard during the last interval (gone: do not
+        // double the long frames while nobody is there)
+        if (lastHeardAgoMs() < standbyHbMs() + 10000) hbRetry = true, hbRetryAt = now + 2000 + rndRange(1000);
+      }
       hbExpectReply = false;
       if (listenKind == LS_SLOT) {  // the master's heartbeat did not come
         slotAt += slotHbMs;
+        st.sbSlotMiss++;
         if (++slotMiss >= 2) slotSync = false;  // the master goes back to the long preamble too
       }
       if (psm() && !conn && !pairing && !powered) {
@@ -1454,6 +1477,13 @@ void loop() {
   }
 
   if (mode == RM_RX) scheduler(now);
+  st.sbSync = (hbSync ? 1 : 0) | (slotSync ? 2 : 0);
+  {  // receiver time continuously on in standby (listening windows)
+    static uint32_t onSince = 0;
+    bool on = psm() && !conn && mode == RM_RX && !dutyRx;
+    if (on && !onSince) onSince = now | 1;
+    else if (!on && onSince) st.rxOnMs += now - onSince, onSince = 0;
+  }
 
   // channel noise sampling for AFH
   if (cfg.afhEnable && hopActive() && mode == RM_RX && (int32_t)(now - nextNoiseSample) >= 0) {

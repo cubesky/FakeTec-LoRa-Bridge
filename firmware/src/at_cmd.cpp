@@ -313,6 +313,11 @@ static void printStats(Print& o) {
            (unsigned long)(s.txBytes ? s.txWire * 100 / s.txBytes : 100));
   o.printf("Hops %lu  syncs %lu  queue %u\r\n", (unsigned long)s.hops, (unsigned long)s.syncs,
            (unsigned)link::queued());
+  o.printf("Standby: sync %s/%s  long-preamble TX %lu  airtime %lu ms  RX on %lu ms\r\n",
+           (s.sbSync & 1) ? "HB" : "-", (s.sbSync & 2) ? "SLOT" : "-", (unsigned long)s.txLong,
+           (unsigned long)s.txAirMs, (unsigned long)s.rxOnMs);
+  o.printf("  misses HB %u slot %u  retries %u  fallbacks %u  resets %u  slot error %d ms\r\n", s.sbHbMiss,
+           s.sbSlotMiss, s.sbRetry, s.sbFallback, s.sbReset, s.sbSlotErr);
   fast::stat(o);
 }
 
@@ -343,7 +348,7 @@ static const char* HELP =
     "AT+ETHNET=10.211.0.0/30 AT+ETHMIP=10.211.0.1 AT+ETHSIP=10.211.0.2\r\n"
     "                   subnet, address of the master's host, of the slave's host (sent to the peer)\r\n"
     "AT+ETHCFG=net/prefix,masterIP,slaveIP   all three at once      AT+ETHST  status\r\n"
-    "AT+PSM=1 AT+SBHB=30 AT+USBACT=1              power save, standby heartbeat s, 1=USB plugged 0=port open\r\n"
+    "AT+PSM=1 AT+SBHB=60 AT+USBACT=1              power save, standby heartbeat s, 1=USB plugged 0=port open\r\n"
     "AT+BLE=1 AT+NAME=xx AT+BLEPIN=0 AT+BLEPAIR=1 (reboot to apply)\r\n"
     "AT+BLEUNBOND       forget all paired phones\r\n"
     "AT+OLED=120 AT+OLEDTYPE=0 AT+FLIP=0 AT+BATCAL=1000 AT+I2C\r\n"

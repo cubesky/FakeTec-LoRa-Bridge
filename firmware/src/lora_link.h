@@ -19,6 +19,12 @@ struct LinkStats {
   float remoteSnr = 0;
   uint8_t remoteBatt = 255;             // 255 = unknown
   uint32_t txRate = 0, rxRate = 0;      // payload bytes / second
+  uint32_t txLong = 0;                  // frames sent with the long wake-up preamble
+  uint32_t txAirMs = 0;                 // total time on air of everything sent
+  uint32_t rxOnMs = 0;                  // standby: time the receiver was continuously on
+  uint16_t sbHbMiss = 0, sbSlotMiss = 0, sbRetry = 0, sbFallback = 0, sbReset = 0;
+  int16_t sbSlotErr = 0;                // slave: last heartbeat start minus expected, ms
+  uint8_t sbSync = 0;                   // standby schedule: bit0 heartbeat answered, bit1 slot known
 };
 
 namespace link {
