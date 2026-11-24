@@ -383,7 +383,7 @@ void setup() {
   }
   TinyUSBDevice.detach();
   configLoad();
-  TinyUSBDevice.setDeviceVersion(0x0110);  // new bcdDevice: Windows re-reads the WinUSB descriptors
+  TinyUSBDevice.setDeviceVersion(0x0140);  // new bcdDevice: Windows re-reads the WinUSB descriptors
   usbWeb.begin();
   eth::begin();
   if (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) {
