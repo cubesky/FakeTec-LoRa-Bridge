@@ -427,7 +427,9 @@ void begin() {
   Bluefruit.Advertising.addService(bleuart);
   Bluefruit.ScanResponse.addName();
   Bluefruit.Advertising.restartOnDisconnect(true);
-  Bluefruit.Advertising.setInterval(32, 244);
+  // 20 ms for the first 30 s (after start-up / a disconnect), then 1022.5 ms: at the default
+  // 152.5 ms the advertising alone costs a sleeping end roughly as much as the LoRa receiver.
+  Bluefruit.Advertising.setInterval(32, 1636);
   Bluefruit.Advertising.setFastTimeout(30);
   Bluefruit.Advertising.start(0);
 }

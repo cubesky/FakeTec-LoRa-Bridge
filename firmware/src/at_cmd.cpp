@@ -582,6 +582,7 @@ void execute(const char* lineIn, Print& o, Port* port) {
     uint32_t reg = NRF_UICR->REGOUT0 & 7;
     o.printf("REGOUT0 (GPIO/VDD voltage): %s  raw=0x%08lX\r\n", vout[reg], (unsigned long)NRF_UICR->REGOUT0);
     o.printf("Regulator mode: %s\r\n", (NRF_POWER->MAINREGSTATUS & 1) ? "high voltage (VDDH)" : "normal (VDD)");
+    o.printf("DC/DC: REG1 %s, REG0 %s\r\n", (NRF_POWER->DCDCEN & 1) ? "on" : "off", (NRF_POWER->DCDCEN0 & 1) ? "on" : "off");
     analogReference(AR_INTERNAL);  // 0.6 V ref, gain 1/6 -> 3.6 V full scale
     analogReadResolution(12);
     uint32_t vraw = analogReadVDD();

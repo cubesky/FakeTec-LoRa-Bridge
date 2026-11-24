@@ -361,6 +361,12 @@ void setup() {
   // SoftDevice is not running yet: POWER registers may be accessed directly
   g_resetReason = NRF_POWER->RESETREAS;
   NRF_POWER->RESETREAS = g_resetReason;  // write 1 to clear
+  // DC/DC instead of LDO: roughly halves the current while the CPU / BLE radio run. The
+  // nice!nano v2 and the SuperMini / ProMicro clones have the inductors for both stages
+  // (REG1: DCC, REG0: DCCH, ZMK enables both); v1 only for REG1 - but v1 runs in normal-voltage
+  // mode (battery via an LDO to VDD), where REG0 is not used. So REG0 only in high-voltage mode.
+  NRF_POWER->DCDCEN = 1;
+  if (NRF_POWER->MAINREGSTATUS & POWER_MAINREGSTATUS_MAINREGSTATUS_Msk) NRF_POWER->DCDCEN0 = 1;
   uint8_t mark = (uint8_t)NRF_POWER->GPREGRET2;
   NRF_POWER->GPREGRET2 = 0;
   g_bootMark = mark;
@@ -437,6 +443,7 @@ void loop() {
   ble::setBattery(battery::percent());
   // "in use": USB plugged in / WebUSB client / a Bluetooth central connected
   link::setActive(usbActive() || ble::connected());
+  link::setPowered(usbPlugged());
   stage(5);
   link::loop();
   fast::loop();
@@ -458,7 +465,11 @@ void loop() {
   }
 
   if (millis() == t && usbOut.empty() && bleOut.empty() && webOut.empty() && link::queued() == 0 && !fast::busy() && !eth::busy()) {
-    // standby: nothing is time critical, let the CPU sleep longer
-    delay(link::isConn() ? 1 : 20);
+    // standby: nothing is time critical, let the CPU sleep longer. On battery even longer
+    // (fewer wake-ups); a radio interrupt ends the wait at once. 50 ms still catches a
+    // button press (debounce 30 ms).
+    if (link::isConn()) delay(1);
+    else if (usbPlugged()) delay(20);
+    else link::waitIrq(50);
   }
 }

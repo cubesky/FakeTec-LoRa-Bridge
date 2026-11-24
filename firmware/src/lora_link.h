@@ -32,6 +32,8 @@ void setActive(bool active);   // a local serial port (USB / BLE UART) is in use
 const char* modeName();        // UNPR / PAIR / STBY / LINK / SRCH / NOOP
 bool isConn();                 // false = power-save standby (duty-cycled RX, slow heartbeat)
 bool powerSave();
+void setPowered(bool p);        // external (USB) power: keep the receiver on in standby
+void waitIrq(uint32_t ms);      // sleep up to ms, return early on a radio interrupt
 size_t queueSpace();
 size_t queued();
 size_t queue(const uint8_t* data, size_t len);  // serial -> LoRa

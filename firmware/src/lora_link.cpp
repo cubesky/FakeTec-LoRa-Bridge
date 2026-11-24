@@ -62,6 +62,8 @@ enum : uint8_t {
 #define FL_LONGPRE 0x10  // frame was sent with the long wake-up preamble
 #define FL_COMP 0x20     // DATA payload is LZ compressed (before encryption)
 #define FL_MUX 0x40      // DATA payload is a piece of the framed stream (serial data + IP packets)
+#define FL_LISTEN 0x80   // standby heartbeat: the sender keeps its receiver on for a moment after
+                         // it, a short-preamble answer reaches it (older firmware ignores the bit)
 #define BCAST 0xFFFFFFFFu
 
 struct __attribute__((packed)) Hdr {
@@ -85,9 +87,15 @@ static void (*rxHandler)(const uint8_t*, size_t) = nullptr;
 
 static volatile bool irqFlag = false;
 static volatile TickType_t irqTicks = 0;
+static TaskHandle_t wakeTask = nullptr;  // main loop task: may be sleeping in waitIrq()
 static void onDio1() {
   irqTicks = xTaskGetTickCountFromISR();
   irqFlag = true;
+  if (wakeTask) {
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(wakeTask, &woken);
+    portYIELD_FROM_ISR(woken);
+  }
 }
 // millis() at the moment the last DIO1 interrupt fired (main loop may lag behind)
 static uint32_t irqMillis() {
@@ -169,12 +177,32 @@ static uint32_t nextSyncBeacon = 0;
 // each frame carries the sender's state, so unplugging either end drops both to standby.
 static bool localActive = false, peerActive = false, peerAwake = false;
 static bool conn = true, dutyRx = false, txLong = false;
-static uint32_t idleSince = 0, connSince = 0;
+// powered: we run from USB, so the receiver stays on in standby too.
+static bool powered = false;
+// Standby heartbeat. A frame to a sleeping peer needs the long wake-up preamble (~0.3 s at full
+// power: by far the biggest standby cost). So the heartbeat runs on a fixed schedule: the master
+// sends one every AT+SBHB seconds, the slave turns its receiver on just around the moment it
+// expects it and answers at once (the sender listens for a moment after the frame: FL_LISTEN).
+// While that works, heartbeat and answer are bare headers with the short preamble. The long one
+// is only used to (re)gain the schedule, to wake the peer, and by the slave when it has missed
+// the master (fallback). Older firmware never answers: then everything stays as before.
+enum : uint8_t { LS_REPLY, LS_SLOT };
+static bool listening = false, replyPending = false, hbExpectReply = false, txShort = false, txListen = false;
+static bool hbSync = false, slotSync = false;
+static uint8_t listenKind = LS_REPLY, hbMiss = 0, slotMiss = 0;
+static uint32_t listenUntil = 0, replyAt = 0, replyWinMs = 120;
+static uint32_t nextHb = 0;                    // master: next scheduled heartbeat
+static uint32_t slotAt = 0, slotHbMs = 30000;  // slave: expected TX start of the master's next heartbeat, its interval
+static uint32_t fallbackAt = 0, annAt = 0;     // slave: own heartbeat if the master stays silent; next announcement
+static uint32_t idleSince = 0, connSince = 0, activeSince = 0;
 static uint16_t wakePre = 64;      // wake-up preamble length in symbols
 static uint32_t wakeExtraMs = 0;   // extra time on air of the wake-up preamble
 static uint8_t byePings = 0;
 #define WAKE_PREAMBLE_MS 300
 #define CONN_LINGER_MS 2000
+// An end whose port has just come into use announces itself every 4 s for this long, then at
+// the standby heartbeat rate: each announcement costs the sleeping peer ~0.2 s of receiving.
+#define ACTIVE_ANNOUNCE_MS 60000
 
 // AFH
 struct ChStat {
@@ -306,6 +334,16 @@ static uint32_t rndRange(uint32_t n) { return n ? rnd32() % n : 0; }
 static bool paired() { return cfg.peerId != 0 && cfg.peerId != BCAST; }
 bool isMaster() { return paired() && g_nodeId < cfg.peerId; }
 static bool psm() { return paired() && cfg.powerSave; }
+static bool standbyAnnounce(uint32_t now) { return localActive && now - activeSince < ACTIVE_ANNOUNCE_MS; }
+static uint32_t standbyHbMs() { return (cfg.standbyHbS ? cfg.standbyHbS : 30) * 1000u; }
+static uint32_t slotWinMs() { return 40 + slotHbMs / 10000; }  // loop latency + 100 ppm clock error
+static void standbyScheduleReset(uint32_t now) {
+  hbSync = slotSync = false;
+  hbMiss = slotMiss = 0;
+  listening = replyPending = hbExpectReply = false;
+  nextHb = now + standbyHbMs();
+  fallbackAt = now + standbyHbMs() * 3 / 2 + rndRange(2000);
+}
 static bool hopActive() {
   return paired() && cfg.hopEnable && cfg.hopChannels >= 2 && !pairing && conn && lstate == LINK_UP;
 }
@@ -391,6 +429,7 @@ static void computeTiming() {
   float symMs = (float)(1u << cfg.sf) / cfgBandwidthKHz();
   turnMs = 12 + ACK_TURN_MS + (uint32_t)(8.0f * symMs + 0.5f);
   hdrWaitMs = 15 + (uint32_t)((cfg.preamble + 14) * symMs + 0.5f);
+  replyWinMs = turnMs + hdrWaitMs + 50;  // answer starts ACK_TURN_MS after our TX_DONE + loop latency
   uint32_t wp = (uint32_t)(WAKE_PREAMBLE_MS / symMs + 0.5f);
   if (wp < cfg.preamble + 16u) wp = cfg.preamble + 16u;
   if (wp > 4000) wp = 4000;
@@ -412,7 +451,7 @@ static void computeTiming() {
 // ---------------------------------------------------------------- radio control
 static void startRx() {
   // header-valid / preamble-detected flags are latched for LBT; only RX_DONE raises DIO1
-  if (psm() && !conn && !pairing) {
+  if (psm() && !conn && !pairing && !powered && !listening) {
     // standby: sleep most of the time, wake just often enough to catch a wake-up preamble
     radio.startReceiveDutyCycleAuto(wakePre, 8,
                                     RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED),
@@ -465,10 +504,11 @@ static bool sendFrame(uint8_t type, uint8_t flags, uint32_t dst, uint16_t seq, c
   Hdr h;
   h.magicType = FRAME_MAGIC | type;
   // a sleeping (duty-cycled) peer only hears frames with the long wake-up preamble
-  bool lng = psm() && !peerAwake && dst == cfg.peerId &&
+  bool lng = psm() && !peerAwake && !txShort && dst == cfg.peerId &&
              (type == FT_PING || type == FT_SYNC || type == FT_DATA || type == FT_FAST || type == FT_ETH);
   if (localActive) flags |= FL_ACTIVE;
   if (conn) flags |= FL_AWAKE;
+  txShort = false;
   if (lng) flags |= FL_LONGPRE;
   h.flags = flags;
   h.src = g_nodeId;
@@ -491,6 +531,7 @@ static bool sendFrame(uint8_t type, uint8_t flags, uint32_t dst, uint16_t seq, c
   }
   mode = RM_TX;
   txType = type;
+  txListen = flags & FL_LISTEN;
   txNeedsAck = flags & FL_ACKREQ;
   txStartMs = lastTxMs = millis();
   txTimeoutMs = toaMs(HDR_LEN + plen) * 2 + 200;  // (toaMs already includes the long preamble)
@@ -536,6 +577,7 @@ static void powerUpdate(uint32_t now) {
     nextSyncBeacon = now;
     forcePing = true;
     waitingAck = false;
+    listening = replyPending = hbExpectReply = false;
     if (mode == RM_RX) {
       radio.standby();
       startRx();  // receiver continuously on from now
@@ -545,6 +587,7 @@ static void powerUpdate(uint32_t now) {
     conn = false;
     peerAwake = false;
     byePings = 0;
+    standbyScheduleReset(now);
     radio.standby();
     if (curCh != 0) {
       radio.setFrequency(channelFreqMHz(0));
@@ -697,6 +740,34 @@ static void handleRx() {
         if (plen >= 9) memcpy(&dg, pl + 5, 4);
         eth::onPeerDigest(plen >= 9, dg);
       }
+      if (psm() && !conn && !pairing) {
+        if (h.flags & FL_LISTEN) {
+          // heartbeat / announcement: answer right away (short preamble: the sender is listening)
+          replyPending = true;
+          replyAt = rxDoneMs + ACK_TURN_MS;
+          bool sched = plen == 0 || (plen >= 10 && (pl[9] & 2));
+          if (sched && !isMaster()) {
+            // the master's scheduled heartbeat: the next one comes one interval after this one started
+            if (plen >= 12) slotHbMs = (uint32_t)(pl[10] | (pl[11] << 8)) * 1000u;
+            uint32_t toa = toaMs(len) + ((h.flags & FL_LONGPRE) ? wakeExtraMs : 0);
+            slotAt = rxDoneMs - toa + slotHbMs;
+            slotSync = slotHbMs >= 5000;
+            slotMiss = 0;
+            fallbackAt = now + slotHbMs * 3 / 2 + rndRange(2000);
+            if (listening && listenKind == LS_SLOT) listening = false;  // after the answer: duty-cycled again
+          }
+        } else if (listening && listenKind == LS_REPLY && hbExpectReply) {
+          // the answer to our scheduled heartbeat: the slave keeps to the schedule
+          hbExpectReply = false;
+          hbSync = true;
+          hbMiss = 0;
+          listening = false;
+          if (!powered) {
+            radio.standby();
+            startRx();  // duty-cycled again
+          }
+        }
+      }
       break;
     case FT_SYNC:
       if (!isMaster()) {
@@ -771,6 +842,7 @@ bool timeCritical() { return mode == RM_TX || waitingAck || ackPending; }
 void setActive(bool a) {
   if (a == localActive) return;
   localActive = a;
+  if (a) activeSince = millis();
   if (!a && conn) byePings = 3;  // tell the peer we are done so both can drop to standby
   else forcePing = true;
 }
@@ -785,6 +857,38 @@ const char* modeName() {
 }
 bool isConn() { return conn; }
 bool powerSave() { return psm(); }
+void setPowered(bool p) {
+  if (p == powered) return;
+  powered = p;
+  if (paired()) forcePing = true;  // tell the peer (ping payload): it then only answers us
+  if (radioReady && mode == RM_RX && psm() && !conn && !pairing) {
+    radio.standby();
+    startRx();  // continuous <-> duty-cycled
+  }
+}
+void waitIrq(uint32_t ms) {
+  if (irqFlag) return;
+  uint32_t now = millis();
+  // do not oversleep a listening window, a due answer or a scheduled heartbeat / slot
+  if (listening) {
+    int32_t d = (int32_t)(listenUntil - now);
+    if (d <= 0) d = 2;  // a frame is still coming in: RX_DONE wakes us
+    if ((uint32_t)d < ms) ms = (uint32_t)d;
+  }
+  if (mode == RM_RX && psm() && !conn && !pairing) {  // (while sending, TX_DONE wakes us)
+    uint32_t t = 0;
+    bool have = false;
+    if (replyPending) t = replyAt, have = true;
+    else if (isMaster()) t = nextHb, have = true;
+    else if (slotSync && !listening) t = slotAt - slotWinMs(), have = true;
+    if (have) {
+      int32_t d = (int32_t)(t - now);
+      if (d <= 0) return;
+      if ((uint32_t)d < ms) ms = (uint32_t)d;
+    }
+  }
+  ulTaskNotifyTake(pdTRUE, ms2tick(ms));
+}
 size_t queueSpace() {
   // the framing is being switched: hold the serial input until the queue has drained
   if (muxTx != muxWant) return 0;
@@ -987,12 +1091,14 @@ bool applyConfig() {
   conn = !psm();
   peerActive = peerAwake = false;
   idleSince = connSince = millis();
+  standbyScheduleReset(idleSince);
   forcePing = paired();  // announce ourselves
   startRx();
   return true;
 }
 
 bool begin() {
+  wakeTask = xTaskGetCurrentTaskHandle();  // called from setup(), i.e. in the loop task
   randomSeed(rnd32());
   txSeq = (uint16_t)rnd32();
   SPI.begin();
@@ -1034,13 +1140,25 @@ static void maybeBuildDataFrame(uint32_t now) {
   txSeq++;
 }
 
-#define PING_LEN 9
-static bool sendPing() {
+#define PING_LEN 12
+static bool sendPing(uint8_t flags = 0, bool sched = false) {
   uint16_t m = isMaster() ? activeMask : ownBadMask;
   uint8_t pl[PING_LEN] = {localBatt, (uint8_t)(int8_t)st.rssi, (uint8_t)(int8_t)(st.snr * 4), (uint8_t)m, (uint8_t)(m >> 8)};
   uint32_t dg = eth::digest();  // checksum of the ETH setting: the peer notices when it runs another one
   memcpy(pl + 5, &dg, 4);
-  return sendFrame(FT_PING, 0, cfg.peerId, 0, pl, PING_LEN);
+  pl[9] = sched ? 2 : 0;  // bit1: scheduled standby heartbeat; [10..11]: the interval in s
+  uint16_t hs = (uint16_t)(standbyHbMs() / 1000);
+  pl[10] = (uint8_t)hs;
+  pl[11] = (uint8_t)(hs >> 8);
+  return sendFrame(FT_PING, flags, cfg.peerId, 0, pl, PING_LEN);
+}
+// standby heartbeat / answer while the schedule holds: bare header, short preamble
+// (the peer's battery and the like are not updated meanwhile)
+static bool sendBeat(uint8_t flags) {
+  txShort = true;
+  bool ok = sendFrame(FT_PING, flags, cfg.peerId, 0, nullptr, 0);
+  txShort = false;
+  return ok;
 }
 
 static void scheduler(uint32_t now) {
@@ -1060,6 +1178,12 @@ static void scheduler(uint32_t now) {
       lstate = LINK_UP;
       lastHeard = now;
     }
+    return;
+  }
+  if (replyPending) {
+    if ((int32_t)(now - replyAt) < 0) return;
+    replyPending = false;
+    if (psm() && !conn) sendBeat(0);  // the peer is listening right now
     return;
   }
 
@@ -1082,7 +1206,10 @@ static void scheduler(uint32_t now) {
   }
 
   // 3. link supervision
-  if (paired() && lastHeardAgoMs() > linkTimeoutMs()) peerActive = peerAwake = false;
+  if (paired() && lastHeardAgoMs() > linkTimeoutMs()) {
+    peerActive = peerAwake = false;
+    hbSync = slotSync = false;
+  }
   if (paired() && lstate == LINK_UP && lastHeardAgoMs() > linkTimeoutMs()) {
     lstate = LINK_SEARCHING;
     waitingAck = false;
@@ -1205,10 +1332,26 @@ static void scheduler(uint32_t now) {
 
   // 8. keepalive ping
   if (paired()) {
+    if (psm() && !conn) {  // standby: scheduled heartbeat (see FL_LISTEN)
+      if (channelBusy()) return;
+      if (forcePing || (standbyAnnounce(now) && (int32_t)(now - annAt) >= 0)) {
+        // announcement (start-up, port came into use - every 4 s for a while -, power changed)
+        forcePing = false;
+        annAt = now + 4000;
+        sendPing(FL_LISTEN);
+      } else if (isMaster() && (int32_t)(now - nextHb) >= 0) {
+        uint32_t hb = standbyHbMs();
+        nextHb += hb;  // fixed cadence: the slave listens at exactly these moments
+        if ((int32_t)(now - nextHb) >= 0) nextHb = now + hb;  // fell behind: new schedule (slave resyncs)
+        hbExpectReply = hbSync ? sendBeat(FL_LISTEN) : sendPing(FL_LISTEN, true);
+      } else if (!isMaster() && (int32_t)(now - fallbackAt) >= 0) {
+        // nothing scheduled from the master for 1.5 intervals: own heartbeat, long preamble
+        fallbackAt = now + standbyHbMs() * 3 / 2 + rndRange(2000);
+        sendPing(FL_LISTEN);
+      }
+      return;
+    }
     uint32_t hb = (cfg.heartbeatS ? cfg.heartbeatS : 3) * 1000u;
-    // standby: slow heartbeat. An end whose port is in use (so it has power) announces itself
-    // more often, so the link comes up quickly once the other end is plugged in too.
-    if (psm() && !conn) hb = localActive ? 4000u : (cfg.standbyHbS ? cfg.standbyHbS : 30) * 1000u;
     if (forcePing || byePings || now - lastTxMs >= hb + (g_nodeId & 0xFF)) {
       if (hop) {
         uint32_t pos = hopClock() % dwell;
@@ -1235,6 +1378,11 @@ void loop() {
         txLong = false;
       }
       uint8_t t = txType;
+      if (txListen && psm() && !conn) {
+        listening = true;  // receiver stays on for the answer
+        listenKind = LS_REPLY;
+        listenUntil = irqMillis() + replyWinMs;
+      }
       startRx();
       if (t == FT_DATA && txNeedsAck) {
         waitingAck = true;
@@ -1264,6 +1412,44 @@ void loop() {
       if (txRing.empty()) muxTx = muxWant;
     } else if (fast::state() != fast::ENDING) {
       fast::release();
+    }
+  }
+
+  // slave: receiver on around the master's scheduled heartbeat
+  if (slotSync && !listening && mode == RM_RX && psm() && !conn && !pairing && !isMaster()) {
+    uint32_t w = slotWinMs();
+    if ((int32_t)(now - (slotAt + w)) > 0) {  // window passed while we were busy (sending)
+      slotAt += slotHbMs;
+      if (++slotMiss >= 2) slotSync = false;
+    } else if ((int32_t)(now - (slotAt - w)) >= 0) {
+      listening = true;
+      listenKind = LS_SLOT;
+      listenUntil = slotAt + w + hdrWaitMs;
+      if (!powered) {
+        radio.standby();
+        startRx();  // continuous while listening
+      }
+    }
+  }
+
+  // end of a listening window (kept open while a frame is coming in)
+  if (listening && mode == RM_RX && (int32_t)(now - listenUntil) >= 0) {
+    uint32_t f = radio.getIrqFlags();
+    bool hdr = f & RADIOLIB_SX126X_IRQ_HEADER_VALID;
+    bool pre = f & RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED;
+    if (!(hdr || pre) || now - listenUntil > (hdr ? toaMaxMs + 100 : hdrWaitMs)) {
+      listening = false;
+      // no answer to a scheduled heartbeat twice: the slave has lost the schedule, long preamble again
+      if (listenKind == LS_REPLY && hbExpectReply && ++hbMiss >= 2) hbSync = false;
+      hbExpectReply = false;
+      if (listenKind == LS_SLOT) {  // the master's heartbeat did not come
+        slotAt += slotHbMs;
+        if (++slotMiss >= 2) slotSync = false;  // the master goes back to the long preamble too
+      }
+      if (psm() && !conn && !pairing && !powered) {
+        radio.standby();
+        startRx();
+      }
     }
   }
 
