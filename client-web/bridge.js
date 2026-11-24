@@ -229,7 +229,8 @@
       return p;
     }
 
-    // +ST=mode,role,rssi,snr,batt,usb,txRate,rxRate,peerBatt,queue,channel,freq,peerRssi,peerSnr,fast,fastRssi
+    // +ST=mode,role,rssi,snr,batt,usb,txRate,rxRate,peerBatt,queue,channel,freq,peerRssi,peerSnr,fast,fastRssi,eth
+    // eth (firmware 1.4.0+): 0 = off, 1 = on but the peer has not followed yet, 2 = on at both ends
     // fast (firmware 1.3.0+): 0 = data on LoRa, 1 = negotiating 2.4 GHz, 2 = data on 2.4 GHz; null = not supported
     async status() {
       const r = await this.cmd('AT+ST');
@@ -238,7 +239,17 @@
       const f = m[1].trim().split(',');
       return { mode: f[0], role: f[1], rssi: +f[2], snr: +f[3], batt: +f[4], usb: f[5] === '1', txRate: +f[6], rxRate: +f[7],
                peerBatt: +f[8], queue: +f[9], channel: +f[10], freq: +f[11], peerRssi: +f[12], peerSnr: +f[13],
-               fast: f.length > 14 ? +f[14] : null, fastRssi: f.length > 15 ? +f[15] : 0 };
+               fast: f.length > 14 ? +f[14] : null, fastRssi: f.length > 15 ? +f[15] : 0,
+               eth: f.length > 16 ? +f[16] : null };
+    }
+
+    // ETH mode (USB network adapter on both ends). The USB device re-enumerates about half a
+    // second after the answer, so a USB connection drops and has to be opened again.
+    async setEth(on) {
+      const r = await this.cmd(on ? 'AT+ETH=1' : 'AT+ETH=0', 4000);
+      const err = r.match(/ERROR:?\s*(.*)/);
+      if (err) throw new Error(err[1] || 'ERROR');
+      return r;
     }
 
     // FAST mode (2.4 GHz high speed link). +FAST=n,state,rssi,loss%,MHz,last reason

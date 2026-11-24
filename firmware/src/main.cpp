@@ -4,6 +4,9 @@
 //             ├─> LoRa (FHSS/ARQ/AES) ──┤
 // BLE NUS  <──┘                         └──> BLE NUS
 //
+// ETH mode adds a USB CDC-NCM network adapter on both ends; IP packets between the two hosts
+// share the same link (eth.cpp).
+//
 // Configuration: "+++" escape on USB / BLE UART, or the BLE config characteristic.
 // Firmware update: 1200 bps touch / double-tap reset -> UF2 + serial DFU bootloader,
 //                  AT+DFU, or BLE OTA DFU.
@@ -16,6 +19,7 @@
 #include "ble_svc.h"
 #include "config.h"
 #include "display.h"
+#include "eth.h"
 #include "fast.h"
 #include "lora_link.h"
 #include "pins.h"
@@ -95,7 +99,7 @@ static void stage(uint8_t s) {
   g_crumb[1] = ~(CRUMB_MAGIC | s);
 }
 const char* stageName(uint8_t s) {
-  static const char* const names[] = {"-", "usb", "webusb", "ble", "battery", "lora", "button", "led", "display", "idle", "setup"};
+  static const char* const names[] = {"-", "usb", "webusb", "ble", "battery", "lora", "button", "led", "display", "idle", "setup", "eth"};
   return s < sizeof(names) / sizeof(names[0]) ? names[s] : "?";
 }
 static void watchdogStart() {
@@ -270,13 +274,26 @@ static void bleTask() {
 }
 
 // ------------------------------------------------------------------ button
-// short press: wake display / next page (status art, link, statistics, settings) / cancel pairing
-// hold 3 s   : pairing mode (60 s)
-// hold 10 s  : unpair
+// short press            : wake display / next page (status art, link, statistics, settings) /
+//                          cancel pairing
+// hold 3 s               : paired and the peer is there (STBY / LINK): ETH mode on / off, on both ends
+//                          not paired yet: pairing mode (60 s)
+// double click + hold 3 s: pairing mode (60 s) in any state - this is how a paired device is
+//                          paired again (click, then press again within half a second and hold)
+// hold 10 s              : unpair
+// What a 3 s hold does is decided when the "RELEASE: ..." hint appears.
+enum : uint8_t { HOLD_NONE, HOLD_PAIR, HOLD_ETH };
+#define DOUBLE_CLICK_MS 500
+static uint8_t holdAction(bool afterClick) {
+  if (afterClick || !cfg.peerId) return HOLD_PAIR;
+  if (link::isPairing()) return HOLD_NONE;
+  const char* m = link::modeName();
+  return (!strcmp(m, "STBY") || !strcmp(m, "LINK")) ? HOLD_ETH : HOLD_NONE;
+}
 static void buttonTask() {
-  static bool down = false;
-  static uint32_t t0 = 0, lastChange = 0;
-  static uint8_t hint = 0;
+  static bool down = false, afterClick = false;
+  static uint32_t t0 = 0, lastChange = 0, lastClick = 0;
+  static uint8_t hint = 0, action = HOLD_NONE;
   bool pressed = digitalRead(PIN_BUTTON) == LOW;
   uint32_t now = millis();
   if (pressed != down && now - lastChange > 30) {
@@ -285,16 +302,25 @@ static void buttonTask() {
     if (down) {
       t0 = now;
       hint = 0;
+      afterClick = lastClick && now - lastClick < DOUBLE_CLICK_MS;
     } else {
       uint32_t d = now - t0;
+      lastClick = d < DOUBLE_CLICK_MS ? (now ? now : 1) : 0;
       if (ble::pairPending()) {
         ble::pairConfirm(d < 3000);  // short press accepts, long press rejects
       } else if (d >= 10000) {
         link::unpair();
         display::toast("UNPAIRED");
       } else if (d >= 3000) {
-        link::startPairing(60000);
-        display::toast("PAIRING 60s");
+        if (!hint) action = holdAction(afterClick);
+        if (action == HOLD_ETH) {
+          bool on = !eth::enabled();
+          const char* why = eth::setEnabled(on);
+          display::toast(why ? "ETH: FAILED" : on ? "ETH MODE ON" : "ETH MODE OFF");
+        } else if (action == HOLD_PAIR) {
+          link::startPairing(60000);
+          display::toast("PAIRING 60s");
+        }
       } else if (!display::isOn()) {
         display::wake();
       } else if (link::isPairing()) {
@@ -315,7 +341,9 @@ static void buttonTask() {
       display::toast("RELEASE: UNPAIR");
     } else if (d >= 3000 && hint < 1) {
       hint = 1;
-      display::toast("RELEASE: PAIR");
+      action = holdAction(afterClick);
+      display::toast(action == HOLD_PAIR ? "RELEASE: PAIR" : action == HOLD_NONE ? "2xCLICK+HOLD: PAIR"
+                     : eth::enabled() ? "RELEASE: ETH OFF" : "RELEASE: ETH ON", 2500);
     }
   }
 }
@@ -343,12 +371,26 @@ void setup() {
     g_hangStage = (uint8_t)c0;
   }
 
-  // WebUSB interface (browser client). It is added after the core started USB, so re-enumerate.
+  // USB: the core has started the device with the serial port only. The WebUSB interface
+  // (browser client) and, in ETH mode, the network adapter are added here - and whether ETH
+  // mode is on is in the settings, which take longer to read than a host waits before it asks
+  // for the descriptors. So stay off the bus until the descriptors are complete: the host
+  // then sees the device once, in its final shape.
+  bool vbus = NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk;
+  if (vbus) {
+    // (the pull-up is switched on by the USB power-ready event, shortly after start-up)
+    for (uint32_t t = millis(); !NRF_USBD->USBPULLUP && millis() - t < 200;) delay(1);
+  }
+  TinyUSBDevice.detach();
+  configLoad();
   TinyUSBDevice.setDeviceVersion(0x0110);  // new bcdDevice: Windows re-reads the WinUSB descriptors
   usbWeb.begin();
-  if (TinyUSBDevice.mounted()) {
-    TinyUSBDevice.detach();
-    delay(10);
+  eth::begin();
+  if (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) {
+    if (NRF_USBD->USBPULLUP) {  // the power-ready event came late and connected us meanwhile
+      TinyUSBDevice.detach();
+      delay(20);
+    }
     TinyUSBDevice.attach();
   }
 
@@ -361,7 +403,6 @@ void setup() {
 
   Serial.begin(115200);
 
-  configLoad();
   applyOutputs();
   ble::begin();  // also enables the SoftDevice (needed for AES / RNG)
 
@@ -399,6 +440,8 @@ void loop() {
   stage(5);
   link::loop();
   fast::loop();
+  stage(11);
+  eth::loop();
 
   stage(6);
   buttonTask();
@@ -414,7 +457,7 @@ void loop() {
     else NVIC_SystemReset();
   }
 
-  if (millis() == t && usbOut.empty() && bleOut.empty() && webOut.empty() && link::queued() == 0 && !fast::busy()) {
+  if (millis() == t && usbOut.empty() && bleOut.empty() && webOut.empty() && link::queued() == 0 && !fast::busy() && !eth::busy()) {
     // standby: nothing is time critical, let the CPU sleep longer
     delay(link::isConn() ? 1 : 20);
   }

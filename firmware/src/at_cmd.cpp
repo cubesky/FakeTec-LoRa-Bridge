@@ -4,6 +4,7 @@
 #include "ble_svc.h"
 #include "config.h"
 #include "display.h"
+#include "eth.h"
 #include "fast.h"
 
 namespace display { const char* probeInfo(); }
@@ -260,6 +261,11 @@ static void printCfg(Print& o) {
            cfg.blePair);
   o.printf("+FASTEN=%u\r\n+FASTLOSS=%u\r\n+FASTRSSI=%d\r\n+FASTPWR=%d\r\n", cfg.fastEnable, cfg.fastLoss, cfg.fastRssi,
            cfg.fastPower);
+  char net[16], mip[16], sip[16];
+  eth::fmtIp(net, sizeof(net), eth::network());
+  eth::fmtIp(mip, sizeof(mip), cfg.ethMasterIp);
+  eth::fmtIp(sip, sizeof(sip), cfg.ethSlaveIp);
+  o.printf("+ETH=%u\r\n+ETHNET=%s/%u\r\n+ETHMIP=%s\r\n+ETHSIP=%s\r\n", cfg.ethEnable ? 1 : 0, net, cfg.ethPrefix, mip, sip);
 }
 
 static void printInfo(Print& o) {
@@ -281,6 +287,14 @@ static void printInfo(Print& o) {
   o.printf("BLE: %s\r\n", ble::connected() ? "connected" : "idle");
   if (fast::isUp()) o.printf("Data path: 2.4G FAST  %.0f MHz  RSSI %d  loss %u%%\r\n", fast::freqMHz(), fast::rssi(), fast::lossPct());
   else o.printf("Data path: LoRa%s\r\n", fast::negotiating() ? " (FAST negotiating)" : "");
+  if (eth::enabled()) {
+    char ip[16];
+    eth::fmtIp(ip, sizeof(ip), eth::hostIp());
+    o.printf("ETH: on, host %s/%u%s%s\r\n", ip, cfg.ethPrefix, eth::leased() ? " (leased)" : "",
+             eth::synced() ? "" : ", waiting for the peer");
+  } else {
+    o.print("ETH: off\r\n");
+  }
   o.printf("OLED: %s\r\n", display::info());
   if (g_resetReason & 0xA) printReset(o);
 }
@@ -324,6 +338,11 @@ static const char* HELP =
     "                   falls back to LoRa by itself when the 2.4 GHz link is bad)\r\n"
     "AT+FAST?           +FAST=0|1|2 (off, negotiating, on),state,RSSI,loss%,MHz,last reason\r\n"
     "AT+FASTEN=1 AT+FASTLOSS=30 AT+FASTRSSI=-85 AT+FASTPWR=8  allow, fallback limits, 2.4G power\r\n"
+    "AT+ETH=1 / 0       network adapter mode on / off, on both ends (USB CDC-NCM + DHCP,\r\n"
+    "                   IP between the two hosts over LoRa / 2.4G; the USB device re-enumerates)\r\n"
+    "AT+ETHNET=10.211.0.0/30 AT+ETHMIP=10.211.0.1 AT+ETHSIP=10.211.0.2\r\n"
+    "                   subnet, address of the master's host, of the slave's host (sent to the peer)\r\n"
+    "AT+ETHCFG=net/prefix,masterIP,slaveIP   all three at once      AT+ETHST  status\r\n"
     "AT+PSM=1 AT+SBHB=30 AT+USBACT=1              power save, standby heartbeat s, 1=USB plugged 0=port open\r\n"
     "AT+BLE=1 AT+NAME=xx AT+BLEPIN=0 AT+BLEPAIR=1 (reboot to apply)\r\n"
     "AT+BLEUNBOND       forget all paired phones\r\n"
@@ -404,6 +423,66 @@ void execute(const char* lineIn, Print& o, Port* port) {
       return;
     }
     fast::release();
+    return ok(o);
+  }
+  if (!strcmp(name, "ETH")) {
+    if (query || !val) return (void)o.printf("+ETH=%u\r\nOK\r\n", cfg.ethEnable ? 1 : 0);
+    bool on = atoi(val) != 0;
+    bool was = eth::enabled();
+    const char* why = eth::setEnabled(on);
+    if (why) return err(o, why);
+    if (was != on) display::toast(on ? "ETH MODE ON" : "ETH MODE OFF");
+    o.print(was != on ? "OK (USB re-enumerates)\r\n" : "OK\r\n");
+    return;
+  }
+  if (!strcmp(name, "ETHST")) {
+    eth::status(o);
+    return ok(o);
+  }
+  if (!strcmp(name, "ETHNET") || !strcmp(name, "ETHMIP") || !strcmp(name, "ETHSIP") || !strcmp(name, "ETHCFG")) {
+    char net[16], mip[16], sip[16];
+    if (query || !val) {
+      eth::fmtIp(net, sizeof(net), eth::network());
+      eth::fmtIp(mip, sizeof(mip), cfg.ethMasterIp);
+      eth::fmtIp(sip, sizeof(sip), cfg.ethSlaveIp);
+      if (name[3] == 'N') o.printf("+ETHNET=%s/%u\r\nOK\r\n", net, cfg.ethPrefix);
+      else if (name[3] == 'M') o.printf("+ETHMIP=%s\r\nOK\r\n", mip);
+      else if (name[3] == 'S') o.printf("+ETHSIP=%s\r\nOK\r\n", sip);
+      else o.printf("+ETHCFG=%s/%u,%s,%s\r\nOK\r\n", net, cfg.ethPrefix, mip, sip);
+      return;
+    }
+    uint32_t m = cfg.ethMasterIp, s = cfg.ethSlaveIp, nw = 0;
+    unsigned prefix = cfg.ethPrefix;
+    const char* why = nullptr;
+    const char* e = val;
+    if (name[3] == 'M') {
+      if (!eth::parseIp(val, m)) return err(o, "AT+ETHMIP=a.b.c.d");
+    } else if (name[3] == 'S') {
+      if (!eth::parseIp(val, s)) return err(o, "AT+ETHSIP=a.b.c.d");
+    } else {
+      // network/prefix
+      char* pe;
+      if (!eth::parseIp(val, nw, &e) || *e != '/') return err(o, "network as a.b.c.d/prefix");
+      prefix = (unsigned)strtoul(e + 1, &pe, 10);
+      if (prefix < 8 || prefix > 30) return err(o, "prefix 8..30");
+      uint32_t mask = 0xFFFFFFFFu << (32 - prefix);
+      nw &= mask;
+      if (name[3] == 'N') {
+        if (*pe) return err(o, "AT+ETHNET=a.b.c.d/prefix");
+        // keep the host part of the two addresses where the new network allows it
+        m = nw | (m & ~mask);
+        s = nw | (s & ~mask);
+        why = eth::setAddresses(m, s, (uint8_t)prefix);
+        if (why) why = eth::setAddresses(nw + 1, nw + 2, (uint8_t)prefix);
+        if (why) return err(o, why);
+        return ok(o);
+      }
+      if (*pe != ',' || !eth::parseIp(pe + 1, m, &e) || *e != ',' || !eth::parseIp(e + 1, s))
+        return err(o, "AT+ETHCFG=a.b.c.d/prefix,masterIP,slaveIP");
+      if ((m & mask) != nw || (s & mask) != nw) return err(o, "addresses are not in that network");
+    }
+    why = eth::setAddresses(m, s, (uint8_t)prefix);
+    if (why) return err(o, why);
     return ok(o);
   }
   if (!strcmp(name, "PAIR")) {
@@ -558,13 +637,15 @@ void execute(const char* lineIn, Print& o, Port* port) {
   if (!strcmp(name, "ST")) {
     // one machine-readable line for clients:
     // mode,role,rssi,snr,batt%,usb,txRate,rxRate,peerBatt,queue,channel,freqMHz,peerRssi,peerSnr,
-    // fast (0 = LoRa, 1 = negotiating 2.4G, 2 = data on 2.4G),fastRssi
+    // fast (0 = LoRa, 1 = negotiating 2.4G, 2 = data on 2.4G),fastRssi,
+    // eth (0 = off, 1 = on, the peer has not followed yet, 2 = on at both ends)
     const LinkStats& s = link::stats();
-    o.printf("+ST=%s,%s,%d,%.1f,%u,%u,%lu,%lu,%u,%u,%u,%.3f,%d,%.1f,%u,%d\r\nOK\r\n", link::modeName(),
+    o.printf("+ST=%s,%s,%d,%.1f,%u,%u,%lu,%lu,%u,%u,%u,%.3f,%d,%.1f,%u,%d,%u\r\nOK\r\n", link::modeName(),
              cfg.peerId ? (link::isMaster() ? "M" : "S") : "-", s.rssi, s.snr, battery::percent(),
              battery::usbPowered() ? 1 : 0, (unsigned long)s.txRate, (unsigned long)s.rxRate, s.remoteBatt,
              (unsigned)link::queued(), link::channel(), link::freqMHz(), s.remoteRssi, s.remoteSnr,
-             fast::isUp() ? 2 : (fast::state() != fast::OFF ? 1 : 0), fast::isUp() ? fast::rssi() : 0);
+             fast::isUp() ? 2 : (fast::state() != fast::OFF ? 1 : 0), fast::isUp() ? fast::rssi() : 0,
+             eth::enabled() ? (eth::synced() ? 2 : 1) : 0);
     return;
   }
   if (!strcmp(name, "HANG")) {

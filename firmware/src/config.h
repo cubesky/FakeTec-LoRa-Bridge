@@ -2,7 +2,7 @@
 #include <Arduino.h>
 
 #define CFG_MAGIC   0x4C4F5241u  // "LORA"
-#define CFG_VERSION 4
+#define CFG_VERSION 5
 
 struct Config {
   uint32_t magic;
@@ -62,6 +62,14 @@ struct Config {
   uint8_t fastLoss;       // fall back to LoRa above this packet loss, %
   int8_t fastRssi;        // ... or below this RSSI, dBm
   int8_t fastPower;       // 2.4 GHz TX power, dBm (-40..8)
+
+  // ---- added in v5: ETH mode (USB CDC-NCM network adapter, see eth.h). These are shared with
+  // the peer: a change on one end is sent to the other.
+  uint8_t ethEnable;
+  uint8_t ethPrefix;      // subnet prefix length, 8..30
+  uint32_t ethMasterIp;   // address of the master's host (a.b.c.d = a << 24 | b << 16 | c << 8 | d)
+  uint32_t ethSlaveIp;    // address of the slave's host
+  uint32_t ethRev;        // revision of the four above: the higher one wins when the ends differ
 
   uint32_t crc;
 };

@@ -16,6 +16,7 @@
 #include <nrf_soc.h>
 
 #include "config.h"
+#include "eth.h"
 #include "fast.h"
 #include "lz.h"
 #include "pins.h"
@@ -52,6 +53,7 @@ enum : uint8_t {
   FT_PAIR_REQ = 6,
   FT_PAIR_ACK = 7,
   FT_FAST = 8,  // FAST mode (2.4 GHz) negotiation, see fast.cpp
+  FT_ETH = 9,   // ETH mode: the shared network setting, see eth.cpp
 };
 #define FL_ENC 0x01
 #define FL_ACKREQ 0x02
@@ -59,6 +61,7 @@ enum : uint8_t {
 #define FL_AWAKE 0x08    // sender's receiver is continuously on (CONN), no wake-up preamble needed
 #define FL_LONGPRE 0x10  // frame was sent with the long wake-up preamble
 #define FL_COMP 0x20     // DATA payload is LZ compressed (before encryption)
+#define FL_MUX 0x40      // DATA payload is a piece of the framed stream (serial data + IP packets)
 #define BCAST 0xFFFFFFFFu
 
 struct __attribute__((packed)) Hdr {
@@ -190,6 +193,104 @@ static uint32_t busySince = 0;
 
 // rate meter
 static uint32_t rateT = 0, rateTx0 = 0, rateRx0 = 0;
+
+// ---------------------------------------------------------------- stream framing (ETH mode)
+// With ETH mode on at both ends, the byte stream to the peer carries two things: the serial
+// data and IP packets. It is cut into frames
+//     C0 <type> <payload> C0        C0 / C1 inside the payload are sent as C1 E0 / C1 E1
+// (neither value occurs in UTF-8 text, so terminal traffic costs 3 bytes per frame and no
+// more). A frame goes into the queue as a whole or not at all, and the framing is switched
+// only while the queue is empty: each LoRa data frame says which kind it carries (FL_MUX), a
+// 2.4 GHz session is told once (fast.cpp). ARQ, compression and the FAST hand-over underneath
+// see plain bytes, as before; after a lost LoRa frame the receiver is back in step at the
+// next C0.
+#define MUX_FLAG 0xC0
+#define MUX_ESC 0xC1
+#define MUX_SERIAL 1
+#define MUX_IP 2
+#define MUX_IP_MAX 1500
+#define NET_BACKLOG 1600  // IP packets are not worth queueing for long: beyond this they are dropped
+static bool muxTx = false, muxWant = false, pendMux = false, fastRxMux = false;
+static void (*netHandler)(const uint8_t*, size_t) = nullptr;
+static uint8_t dType = 0;  // frame being received: 0 = none (skip to the next C0), 0xFF = its type byte is next
+static bool dEsc = false, dBad = false;
+static uint8_t dIp[MUX_IP_MAX];
+static size_t dIpLen = 0;
+
+static inline bool muxSpecial(uint8_t c) { return c == MUX_FLAG || c == MUX_ESC; }
+static size_t muxSize(const uint8_t* d, size_t n) {
+  size_t k = n + 3;
+  for (size_t i = 0; i < n; i++)
+    if (muxSpecial(d[i])) k++;
+  return k;
+}
+// (the caller has checked that muxSize() bytes fit)
+static void muxPut(uint8_t type, const uint8_t* d, size_t n) {
+  uint8_t b[68];
+  size_t k = 0;
+  b[k++] = MUX_FLAG;
+  b[k++] = type;
+  for (size_t i = 0; i < n; i++) {
+    uint8_t c = d[i];
+    if (muxSpecial(c)) {
+      b[k++] = MUX_ESC;
+      b[k++] = c ^ 0x20;
+    } else {
+      b[k++] = c;
+    }
+    if (k >= 64) {
+      txRing.write(b, k);
+      k = 0;
+    }
+  }
+  b[k++] = MUX_FLAG;
+  txRing.write(b, k);
+}
+// received user bytes -> serial ports / network
+static void deliver(const uint8_t* d, size_t n, bool mux) {
+  if (!mux) {
+    dType = 0;
+    if (rxHandler && n) rxHandler(d, n);
+    return;
+  }
+  static uint8_t ser[256];
+  size_t sn = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint8_t c = d[i];
+    if (c == MUX_FLAG) {
+      if (dType == MUX_IP && !dBad && !dEsc && dIpLen && netHandler) netHandler(dIp, dIpLen);
+      dType = 0xFF;
+      dEsc = dBad = false;
+      dIpLen = 0;
+      continue;
+    }
+    if (dType == 0xFF) {
+      dType = (c == MUX_SERIAL || c == MUX_IP) ? c : 0;
+      continue;
+    }
+    if (!dType) continue;
+    if (c == MUX_ESC) {
+      dEsc = true;
+      continue;
+    }
+    if (dEsc) {
+      c ^= 0x20;
+      dEsc = false;
+    }
+    if (dType == MUX_SERIAL) {
+      ser[sn++] = c;
+      if (sn == sizeof(ser)) {
+        if (rxHandler) rxHandler(ser, sn);
+        sn = 0;
+      }
+    } else if (dIpLen < sizeof(dIp)) {
+      dIp[dIpLen++] = c;
+    } else {
+      dBad = true;
+    }
+  }
+  if (sn && rxHandler) rxHandler(ser, sn);
+}
 
 // ---------------------------------------------------------------- helpers
 static uint32_t rnd32() {
@@ -365,7 +466,7 @@ static bool sendFrame(uint8_t type, uint8_t flags, uint32_t dst, uint16_t seq, c
   h.magicType = FRAME_MAGIC | type;
   // a sleeping (duty-cycled) peer only hears frames with the long wake-up preamble
   bool lng = psm() && !peerAwake && dst == cfg.peerId &&
-             (type == FT_PING || type == FT_SYNC || type == FT_DATA || type == FT_FAST);
+             (type == FT_PING || type == FT_SYNC || type == FT_DATA || type == FT_FAST || type == FT_ETH);
   if (localActive) flags |= FL_ACTIVE;
   if (conn) flags |= FL_AWAKE;
   if (lng) flags |= FL_LONGPRE;
@@ -559,11 +660,11 @@ static void handleRx() {
         static uint8_t raw[LZ_RAW_MAX];
         size_t n = lzDecompress(pl, plen, raw, sizeof(raw));
         st.rxBytes += n;
-        if (rxHandler && n) rxHandler(raw, n);
+        deliver(raw, n, h.flags & FL_MUX);
         break;
       }
       st.rxBytes += plen;
-      if (rxHandler && plen) rxHandler(pl, plen);
+      deliver(pl, plen, h.flags & FL_MUX);
       break;
     }
     case FT_ACK:
@@ -591,6 +692,10 @@ static void handleRx() {
         } else {
           activeMask = m;
         }
+        // newer firmware appends the checksum of its ETH setting
+        uint32_t dg = 0;
+        if (plen >= 9) memcpy(&dg, pl + 5, 4);
+        eth::onPeerDigest(plen >= 9, dg);
       }
       break;
     case FT_SYNC:
@@ -609,6 +714,10 @@ static void handleRx() {
     case FT_FAST:
       if (h.flags & FL_ENC) aesCtr(pl, plen, h);
       fast::onCtl(pl, plen);
+      break;
+    case FT_ETH:
+      if (h.flags & FL_ENC) aesCtr(pl, plen, h);
+      eth::onCtl(pl, plen);
       break;
   }
 }
@@ -677,17 +786,50 @@ const char* modeName() {
 bool isConn() { return conn; }
 bool powerSave() { return psm(); }
 size_t queueSpace() {
+  // the framing is being switched: hold the serial input until the queue has drained
+  if (muxTx != muxWant) return 0;
   // FAST mode: keep room for the bytes that may come back from the 2.4 GHz queue
   size_t s = txRing.space(), r = fast::state() != fast::OFF ? 2048 : 0;
-  return s > r ? s - r : 0;
+  s = s > r ? s - r : 0;
+  if (muxTx) s = s > 8 ? (s - 4) / 2 : 0;  // framed: at worst every byte is escaped
+  return s;
 }
 size_t queued() { return txRing.used() + (pendValid ? pendRaw : 0); }
 size_t queue(const uint8_t* d, size_t n) {
-  size_t w = txRing.write(d, n);
+  size_t w = 0;
+  if (muxTx) {
+    // one frame with as much of the data as fits
+    size_t sp = txRing.space(), k = 3;
+    while (w < n) {
+      size_t c = muxSpecial(d[w]) ? 2 : 1;
+      if (k + c > sp) break;
+      k += c;
+      w++;
+    }
+    if (w) muxPut(MUX_SERIAL, d, w);
+  } else {
+    w = txRing.write(d, n);
+  }
   if (w) lastQueueIn = millis();
   return w;
 }
 void setRxHandler(void (*cb)(const uint8_t*, size_t)) { rxHandler = cb; }
+
+void setMux(bool want) { muxWant = want; }
+bool muxActive() { return muxTx; }
+void setNetHandler(void (*cb)(const uint8_t*, size_t)) { netHandler = cb; }
+void setFastRxMux(bool mux) { fastRxMux = mux; }
+bool queuePacket(const uint8_t* d, size_t n) {
+  if (!muxTx || !muxWant || !n || n > MUX_IP_MAX) return false;
+  if (!conn || lstate != LINK_UP) return false;  // only over an active link
+  size_t need = muxSize(d, n), used = txRing.used();
+  size_t r = fast::state() != fast::OFF ? 2048 : 0;
+  if (need + r > txRing.space()) return false;
+  if (!fast::isUp() && used && used + need > NET_BACKLOG) return false;
+  muxPut(MUX_IP, d, n);
+  lastQueueIn = millis();
+  return true;
+}
 
 void startPairing(uint32_t ms) {
   for (int i = 0; i < 16; i += 4) {
@@ -747,7 +889,7 @@ void fastRequeue(const uint8_t* d, size_t n) {
 void fastDeliver(const uint8_t* d, size_t n) {
   st.rxBytes += n;
   fastRxMs = millis();
-  if (rxHandler && n) rxHandler(d, n);
+  deliver(d, n, fastRxMux);
 }
 const LinkStats& stats() { return st; }
 void resetStats() {
@@ -865,6 +1007,7 @@ static void maybeBuildDataFrame(uint32_t now) {
   if (maxp > MAX_PAYLOAD) maxp = MAX_PAYLOAD;
   if (txRing.used() < maxp && now - lastQueueIn < cfg.packTimeoutMs) return;
   pendComp = false;
+  pendMux = muxTx;  // (the queue holds one kind only, see the switch in loop())
   pendLen = 0;
   size_t avail = txRing.used();
   if (cfg.compress && avail > 16) {
@@ -891,10 +1034,13 @@ static void maybeBuildDataFrame(uint32_t now) {
   txSeq++;
 }
 
+#define PING_LEN 9
 static bool sendPing() {
   uint16_t m = isMaster() ? activeMask : ownBadMask;
-  uint8_t pl[5] = {localBatt, (uint8_t)(int8_t)st.rssi, (uint8_t)(int8_t)(st.snr * 4), (uint8_t)m, (uint8_t)(m >> 8)};
-  return sendFrame(FT_PING, 0, cfg.peerId, 0, pl, 5);
+  uint8_t pl[PING_LEN] = {localBatt, (uint8_t)(int8_t)st.rssi, (uint8_t)(int8_t)(st.snr * 4), (uint8_t)m, (uint8_t)(m >> 8)};
+  uint32_t dg = eth::digest();  // checksum of the ETH setting: the peer notices when it runs another one
+  memcpy(pl + 5, &dg, 4);
+  return sendFrame(FT_PING, 0, cfg.peerId, 0, pl, PING_LEN);
 }
 
 static void scheduler(uint32_t now) {
@@ -991,12 +1137,20 @@ static void scheduler(uint32_t now) {
     return;  // hold data until the hop clock is synchronised
   }
 
-  // 6b. FAST mode control frames
+  // 6b. FAST / ETH mode control frames
   if (paired()) {
     static uint8_t ctl[24];
     static size_t ctlLen = 0;
     static uint16_t ctlSeq = 0;
-    if (!ctlLen) ctlLen = fast::ctlPoll(ctl, sizeof(ctl));
+    static uint8_t ctlType = FT_FAST;
+    if (!ctlLen) {
+      ctlType = FT_FAST;
+      ctlLen = fast::ctlPoll(ctl, sizeof(ctl));
+      if (!ctlLen) {
+        ctlType = FT_ETH;
+        ctlLen = eth::ctlPoll(ctl, sizeof(ctl));
+      }
+    }
     if (ctlLen) {
       if (hop) {
         uint32_t pos = hopClock() % dwell;
@@ -1005,7 +1159,7 @@ static void scheduler(uint32_t now) {
       if (channelBusy()) return;
       size_t n = ctlLen;
       ctlLen = 0;
-      sendFrame(FT_FAST, (cfg.encrypt && !keyIsZero()) ? FL_ENC : 0, cfg.peerId, ++ctlSeq, ctl, n);
+      sendFrame(ctlType, (cfg.encrypt && !keyIsZero()) ? FL_ENC : 0, cfg.peerId, ++ctlSeq, ctl, n);
       return;
     }
   }
@@ -1034,6 +1188,7 @@ static void scheduler(uint32_t now) {
       if (useAck) flags |= FL_ACKREQ;
     }
     if (pendComp) flags |= FL_COMP;
+    if (pendMux) flags |= FL_MUX;
     static uint8_t tmp[MAX_PAYLOAD];
     memcpy(tmp, pendBuf, pendLen);  // sendFrame encrypts in its own buffer
     pendTries++;
@@ -1057,7 +1212,7 @@ static void scheduler(uint32_t now) {
     if (forcePing || byePings || now - lastTxMs >= hb + (g_nodeId & 0xFF)) {
       if (hop) {
         uint32_t pos = hopClock() % dwell;
-        if (pos < SLOT_GUARD_MS || dwell - pos < toaMs(HDR_LEN + 5) + SLOT_GUARD_MS) return;
+        if (pos < SLOT_GUARD_MS || dwell - pos < toaMs(HDR_LEN + PING_LEN) + SLOT_GUARD_MS) return;
       }
       if (channelBusy()) return;
       forcePing = false;
@@ -1100,6 +1255,16 @@ void loop() {
       txLong = false;
     }
     startRx();
+  }
+
+  // ETH mode on / off: the stream changes between plain and framed once nothing of the old
+  // kind is queued any more. A 2.4 GHz session keeps the kind it started with, so it ends first.
+  if (muxTx != muxWant) {
+    if (fast::state() == fast::OFF) {
+      if (txRing.empty()) muxTx = muxWant;
+    } else if (fast::state() != fast::ENDING) {
+      fast::release();
+    }
   }
 
   if (mode == RM_RX) scheduler(now);

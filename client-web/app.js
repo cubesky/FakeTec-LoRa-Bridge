@@ -70,7 +70,10 @@ const LABELS = {
   BLE: '蓝牙', NAME: '蓝牙名称', BLEPIN: '蓝牙固定配对码 (0=关)', BLEPAIR: '蓝牙允许方式 (1=按钮 2=数字比对 3=加密配对 0=开放)',
   OLED: '息屏时间 s (0=常亮)', OLEDTYPE: '屏幕 (0=SSD1306 1=SH1106)', FLIP: '屏幕翻转', BATCAL: '电池校准 x1000', OUT: '输出位',
   FASTEN: '允许 2.4G 高速模式', FASTLOSS: '高速回退丢包门限 %', FASTRSSI: '高速回退 RSSI 门限 dBm', FASTPWR: '2.4G 发射功率 dBm',
+  ETH: '网卡模式 (两端同步)', ETHNET: '网段 (地址/前缀长度)', ETHMIP: '主端 IP (主机一侧电脑)', ETHSIP: '从端 IP (从机一侧电脑)',
 };
+// the three address settings belong together: they are checked and sent to the peer as one
+const ETH_ADDR = ['ETHNET', 'ETHMIP', 'ETHSIP'];
 const READONLY = new Set(['PEER']);
 
 function renderCfg(cfg) {
@@ -103,13 +106,21 @@ async function applyCfg() {
   const changed = [...document.querySelectorAll('#fields input.changed')];
   if (!changed.length) { log('没有修改'); return; }
   const lines = [];
+  const run = async (line) => { try { lines.push(`${line}\n${await bridge.cmd(line, 4000)}`); } catch (e) { lines.push(`${line}\n${e.message}`); } };
+  const val = (k) => { const i = document.querySelector(`#fields input[data-key="${k}"]`); return i ? i.value.trim() : ''; };
   for (const i of changed) {
-    const line = `AT+${i.dataset.key}=${i.value.trim()}`;
-    try { lines.push(`${line}\n${await bridge.cmd(line)}`); } catch (e) { lines.push(`${line}\n${e.message}`); }
+    if (ETH_ADDR.includes(i.dataset.key) || i.dataset.key === 'ETH') continue;
+    await run(`AT+${i.dataset.key}=${i.value.trim()}`);
   }
+  // network + both host addresses in one command (both ends take them over, the hosts get
+  // their new address by themselves)
+  if (changed.some((i) => ETH_ADDR.includes(i.dataset.key))) await run(`AT+ETHCFG=${val('ETHNET')},${val('ETHMIP')},${val('ETHSIP')}`);
+  // last: switching the network adapter on / off re-enumerates the USB device
+  const eth = changed.find((i) => i.dataset.key === 'ETH');
+  if (eth) await run(`AT+ETH=${eth.value.trim()}`);
   log(lines.join('\n'));
   showPane('ctl');
-  await reloadCfg();
+  if (!eth || bridge.kind !== 'usb') await reloadCfg();
 }
 
 // ---- FAST mode (2.4 GHz high speed link) switch
@@ -126,7 +137,8 @@ function showFast(v) {
   fastState = v;
   const b = $('#fast');
   const ble = bridge.kind === 'ble';
-  b.disabled = !bridge.connected || fastBusy || v === null || (ble && v === 0);
+  // always usable while connected: when FAST mode is not possible the click explains why
+  b.disabled = !bridge.connected || fastBusy;
   b.classList.toggle('on', v === 2);
   b.classList.toggle('neg', v === 1 || fastBusy);
   b.textContent = fastBusy || v === 1 ? '2.4G 协商中…' : v === 2 ? '2.4G 高速：开' : '2.4G 高速';
@@ -136,6 +148,17 @@ function showFast(v) {
 }
 $('#fast').addEventListener('click', async () => {
   if (fastBusy || !bridge.connected) return;
+  if (fastState === null || fastState === undefined) {
+    // status line without the FAST field: old firmware (or a stale cached script, see index.html)
+    let st = null;
+    try { st = await bridge.fastStatus(); } catch (e) { /* no answer */ }
+    if (!st) { modal('不支持 2.4G 高速模式', ['设备固件不支持高速模式，需要 1.3.0 或更新。'], { error: true }); return; }
+    fastState = st.fast;
+  }
+  if (bridge.kind === 'ble' && fastState !== 2) {
+    modal('蓝牙连接下不能使用 2.4G 高速模式', ['2.4G 高速链路与蓝牙共用同一个射频，两端都没有蓝牙连接时才能启用。', '请断开蓝牙，改用 USB 连接本页面后再切换。'], { error: true });
+    return;
+  }
   const on = fastState !== 2;
   fastBusy = true;
   showFast(fastState);
@@ -150,6 +173,48 @@ $('#fast').addEventListener('click', async () => {
   }
   poll();
 });
+
+// ---- ETH mode (USB network adapter on both ends) switch
+let ethState = null;     // last value from AT+ST: null = unknown / firmware without ETH mode
+function showEth(v) {
+  ethState = v;
+  const b = $('#eth');
+  b.disabled = !bridge.connected;
+  b.classList.toggle('on', v === 2);
+  b.classList.toggle('wait', v === 1);
+  b.textContent = v === 2 ? '网卡模式：开' : v === 1 ? '网卡模式：等待对端' : '网卡模式';
+}
+$('#eth').addEventListener('click', async () => {
+  if (!bridge.connected) return;
+  if (ethState === null || ethState === undefined) {
+    modal('不支持网卡模式', ['设备固件不支持网卡模式，需要 1.4.0 或更新。'], { error: true });
+    return;
+  }
+  const on = !ethState;
+  try {
+    await bridge.setEth(on);
+    if (bridge.kind === 'usb') modal(on ? '网卡模式已开启' : '网卡模式已关闭', ['两端的 USB 设备会重新枚举，本页面稍后自动重新连接。'], { busy: true });
+    else poll();
+  } catch (e) {
+    const why = { 'not paired': '尚未配对', 'invalid addresses (AT+ETHCFG)': 'IP 设置无效' }[e.message] || e.message;
+    modal('未能切换网卡模式', [why], { error: true });
+  }
+});
+
+// The USB device left the bus: it re-enumerates when ETH mode is switched (here, on the device
+// or by the peer), so look for it again for a few seconds before reporting it as unplugged.
+async function usbGone(serial) {
+  setConnected(false);
+  modal('USB 设备重新连接中', ['设备已从 USB 断开；如果是切换了网卡模式，它会在几秒内回来。'], { busy: true });
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 400));
+    let dev = null;
+    try { const devs = await navigator.usb.getDevices(); dev = devs.find((d) => d.serialNumber === serial) || null; } catch (e) { /* retry */ }
+    if (!dev || busy || bridge.connected) continue;
+    try { await bridge.open(dev); setConnected(true); closeModal(); await reloadCfg(); return; } catch (e) { /* not ready yet */ }
+  }
+  if (!bridge.connected) modal('设备已拔出', ['USB 设备已断开。'], { error: true });
+}
 
 // ---- status bar
 async function poll() {
@@ -170,6 +235,7 @@ async function poll() {
     const role = s.role === 'M' ? '主机' : s.role === 'S' ? '从机' : '';
     const peer = s.peerBatt <= 100 ? ` · 对端 <b>${s.peerBatt}%</b>` : '';
     const fast = s.fast === 2 ? ` · <b>2.4G</b> RSSI <b>${s.fastRssi}</b>` : '';
+    showEth(s.eth);
     $('#stext').innerHTML = `${role} · <b>${s.freq.toFixed(3)}</b> MHz ch${s.channel} · RSSI <b>${s.rssi}</b> SNR <b>${s.snr}</b>${fast} · TX <b>${s.txRate}</b> RX <b>${s.rxRate}</b> B/s · Q <b>${s.queue}</b> · 电池 <b>${s.batt}%</b>${s.usb ? ' USB' : ''}${peer}`;
   } catch (e) { /* next round */ }
 }
@@ -187,6 +253,7 @@ function setConnected(on) {
   if (on) { pollTimer = setInterval(poll, 2000); poll(); }
   else { $('#mode').textContent = '----'; $('#mode').className = 'badge'; $('#stext').textContent = '未连接'; fastBusy = false; }
   showFast(on ? fastState : null);
+  showEth(on ? ethState : null);
 }
 
 async function connect(dev) {
@@ -285,7 +352,7 @@ if (navigator.usb) {
       setConnected(bridge.connected);
     }
   });
-  navigator.usb.addEventListener('disconnect', (e) => { if (bridge.dev === e.device) { bridge.running = false; bridge.dev = null; bridge.kind = null; setConnected(false); modal('设备已拔出', ['USB 设备已断开。'], { error: true }); } });
+  navigator.usb.addEventListener('disconnect', (e) => { if (bridge.dev === e.device) { const serial = e.device.serialNumber; bridge.running = false; bridge.dev = null; bridge.kind = null; usbGone(serial); } });
   // reconnect to a device that was authorised before
   navigator.usb.getDevices().then((devs) => { if (devs.length === 1) connect(devs[0]).catch(() => {}); });
 }

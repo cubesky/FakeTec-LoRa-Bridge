@@ -87,12 +87,19 @@ void configDefaults(Config& c) {
   c.fastLoss = 30;
   c.fastRssi = -85;
   c.fastPower = 8;
+
+  c.ethEnable = 0;
+  c.ethPrefix = 30;
+  c.ethMasterIp = (10u << 24) | (211u << 16) | 1;  // 10.211.0.1
+  c.ethSlaveIp = (10u << 24) | (211u << 16) | 2;   // 10.211.0.2
+  c.ethRev = 0;
 }
 
 // Older files have the identical layout up to their last field, followed by the CRC:
-// v2 ends with "outputs", v3 with "compress".
+// v2 ends with "outputs", v3 with "compress", v4 with "fastPower".
 #define CFG_V2_BODY (offsetof(Config, outputs) + 1)
 #define CFG_V3_BODY (offsetof(Config, compress) + 1)
+#define CFG_V4_BODY (offsetof(Config, fastPower) + 1)
 
 bool configSave();
 // keeps pairing + settings, the fields the old version did not have stay at their defaults
@@ -126,7 +133,7 @@ void configLoad() {
     cfg = tmp;
     cfg.bleName[sizeof(cfg.bleName) - 1] = 0;
   } else if (tmp.magic == CFG_MAGIC) {
-    if (!loadOld(tmp, n, 3, CFG_V3_BODY)) loadOld(tmp, n, 2, CFG_V2_BODY);
+    if (!loadOld(tmp, n, 4, CFG_V4_BODY) && !loadOld(tmp, n, 3, CFG_V3_BODY)) loadOld(tmp, n, 2, CFG_V2_BODY);
   }
 }
 

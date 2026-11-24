@@ -6,6 +6,7 @@
 #include "battery.h"
 #include "ble_svc.h"
 #include "config.h"
+#include "eth.h"
 #include "fast.h"
 #include "lora_link.h"
 #include "pins.h"
@@ -219,6 +220,7 @@ static void titleBar() {
 //   NOOP  blinking x, dotted peer box (peer not found)
 //   UNPR  dotted peer box  (not paired)
 //   PAIR  <- ->  closing in
+//   ETH mode: [ETH] under the wire (blinks until the peer has switched as well)
 static void pageArt() {
   const LinkStats& s = link::stats();
   const char* mode = link::modeName();
@@ -301,14 +303,21 @@ static void pageArt() {
     seg[4] = (f & 1) ? '?' : ' ';
     snprintf(l4, sizeof(l4), "Hold button 3s: pair");
   }
+  // ETH mode: the address of this end's host takes the place of the radio settings
+  if (eth::enabled() && !hs && strcmp(mode, "LINK")) {
+    char ip[16];
+    eth::fmtIp(ip, sizeof(ip), eth::hostIp());
+    snprintf(l5, sizeof(l5), "IP %s/%u", ip, cfg.ethPrefix);
+  }
   if (!link::radioOk()) snprintf(l4, sizeof(l4), "RADIO %s", link::radioStatus());
+  const char* tag = (eth::enabled() && (eth::synced() || (f & 1))) ? "  [ETH]  " : "         ";
 
   char l[32];
   snprintf(l, sizeof(l), " .---.%s%s", hs ? ((f & 1) ? "  2.4G   " : " >2.4G<  ") : "         ", ghost ? ". - ." : ".---.");
   oled->drawStr(0, 21, l);
   snprintf(l, sizeof(l), " | %c |%s%c %c %c", me, seg, ghost ? ':' : '|', pe, ghost ? ':' : '|');
   oled->drawStr(0, 31, l);
-  snprintf(l, sizeof(l), " '---'         %s", ghost ? "' - '" : "'---'");
+  snprintf(l, sizeof(l), " '---'%s%s", tag, ghost ? "' - '" : "'---'");
   oled->drawStr(0, 41, l);
   oled->drawStr(0, 53, l4);
   oled->drawStr(0, 63, l5);
@@ -377,7 +386,13 @@ static void pageCfg() {
   oled->drawStr(0, 32, l);
   snprintf(l, sizeof(l), "ACK %u x%u ENC %u AFH %u", cfg.ack, cfg.retries, cfg.encrypt, cfg.afhEnable);
   oled->drawStr(0, 43, l);
-  snprintf(l, sizeof(l), "%.20s", cfg.bleName);
+  if (eth::enabled()) {
+    char ip[16];
+    eth::fmtIp(ip, sizeof(ip), eth::hostIp());
+    snprintf(l, sizeof(l), "ETH %s/%u", ip, cfg.ethPrefix);
+  } else {
+    snprintf(l, sizeof(l), "%.20s", cfg.bleName);
+  }
   oled->drawStr(0, 54, l);
   snprintf(l, sizeof(l), "Bat %.2fV %s", battery::volts(), battery::usbPowered() ? "USB" : "");
   oled->drawStr(0, 64, l);

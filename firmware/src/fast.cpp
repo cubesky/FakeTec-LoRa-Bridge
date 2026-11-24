@@ -1,8 +1,10 @@
 // FAST mode: negotiation over LoRa, data over the 2.4 GHz link, supervision and fallback.
 //
 // Control frames (LoRa frame type FT_FAST, payload):
-//   REQ    : 1, nonceA(4), flags(bit0 = encrypt), nch, channels...   initiator -> responder
-//   ACCEPT : 2, nonceA(4), nonceB(4)                                 responder starts its radio first
+//   REQ    : 1, nonceA(4), flags(bit0 = encrypt, bit1 = my stream is framed), nch, channels...
+//   ACCEPT : 2, nonceA(4), nonceB(4), flags(bit0 = my stream is framed)
+//            (initiator -> responder, the responder starts its radio first; "framed": ETH mode,
+//            see lora_link.cpp - the flag byte of ACCEPT is missing with older firmware)
 //   REJECT : 3, nonceA(4), reason
 //   END    : 4, nonceA(4), flags(bit0 = "I have your count"), reason, rxCount(4)
 //
@@ -436,7 +438,7 @@ size_t ctlPoll(uint8_t* buf, size_t max) {
     nextCtl = now + retry;
     buf[0] = C_REQ;
     put32(buf + 1, nonceA);
-    buf[5] = sessionEnc ? 1 : 0;
+    buf[5] = (sessionEnc ? 1 : 0) | (link::muxActive() ? 2 : 0);
     buf[6] = nch;
     memcpy(buf + 7, chs, nch);
     return 7 + nch;
@@ -464,7 +466,8 @@ static void queueAccept() {
   reply[0] = C_ACCEPT;
   put32(reply + 1, nonceA);
   put32(reply + 5, nonceB);
-  replyLen = 9;
+  reply[9] = link::muxActive() ? 1 : 0;
+  replyLen = 10;
 }
 
 void onCtl(const uint8_t* pl, size_t n) {
@@ -496,6 +499,7 @@ void onCtl(const uint8_t* pl, size_t n) {
       nonceA = nonce;
       nonceB = link::random32();
       sessionEnc = (pl[5] & 1) && !keyIsZero();
+      link::setFastRxMux(pl[5] & 2);
       nch = pl[6];
       memcpy(chs, pl + 7, nch);
       if (!startRadio()) return queueReject(nonce, R_RADIO);
@@ -508,6 +512,7 @@ void onCtl(const uint8_t* pl, size_t n) {
     case C_ACCEPT:
       if (st != REQ || nonce != nonceA || n < 9) return;
       nonceB = get32(pl + 5);
+      link::setFastRxMux(n >= 10 && (pl[9] & 1));
       if (!startRadio()) return fail(R_RADIO);
       probeMs = PROBE_INIT_MS;
       st = PROBE;

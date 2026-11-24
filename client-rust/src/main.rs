@@ -77,6 +77,12 @@ enum Cmd {
         #[arg(value_enum)]
         mode: Option<OnOff>,
     },
+    /// ETH mode: a USB network adapter on both ends, IP between the two hosts (`eth on`,
+    /// `eth off`), or its state (`eth`). Addresses: `set ethcfg 10.211.0.0/30,10.211.0.1,10.211.0.2`
+    Eth {
+        #[arg(value_enum)]
+        mode: Option<OnOff>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -234,6 +240,8 @@ struct Status {
     /// FAST mode (firmware 1.3.0+): 0 = data on LoRa, 1 = negotiating, 2 = data on 2.4 GHz
     fast: Option<u32>,
     fast_rssi: i32,
+    /// ETH mode (firmware 1.4.0+): 0 = off, 1 = on, waiting for the peer, 2 = on at both ends
+    eth: Option<u32>,
 }
 
 fn parse_status(rsp: &str) -> Option<Status> {
@@ -257,6 +265,7 @@ fn parse_status(rsp: &str) -> Option<Status> {
         freq: f[11].parse().ok()?,
         fast: f.get(14).and_then(|v| v.parse().ok()),
         fast_rssi: f.get(15).and_then(|v| v.parse().ok()).unwrap_or(0),
+        eth: f.get(16).and_then(|v| v.parse().ok()),
     })
 }
 
@@ -310,11 +319,17 @@ fn status_line(s: &Status) -> String {
         Some(1) => format!("  {}", "FAST...".yellow()),
         _ => String::new(),
     };
+    let eth = match s.eth {
+        Some(2) => format!("  {}", "ETH".white().on_blue()),
+        Some(1) => format!("  {}", "ETH...".blue()),
+        _ => String::new(),
+    };
     format!(
-        "{} {}{}  {} {:.3} MHz ch {}  {} {} dBm / {:.1} dB  {} {} B/s  {} {} B/s  {} {}  {} {}%{}{}",
+        "{} {}{}{}  {} {:.3} MHz ch {}  {} {} dBm / {:.1} dB  {} {} B/s  {} {} B/s  {} {}  {} {}%{}{}",
         mode_styled(&s.mode),
         role,
         fast,
+        eth,
         "freq".dark_grey(),
         s.freq,
         s.channel,
@@ -711,6 +726,19 @@ fn run(cli: Cli) -> Result<()> {
                         Err(e) => bail!("FAST mode: {e} - data stays on LoRa"),
                     }
                     run_cmd(&mut dev, "AT+FAST?")
+                }
+                Cmd::Eth { mode: None } => run_cmd(&mut dev, "AT+ETHST"),
+                Cmd::Eth { mode: Some(m) } => {
+                    let rsp = dev.cmd(if *m == OnOff::On { "AT+ETH=1" } else { "AT+ETH=0" })?;
+                    if let Some(e) = rsp.lines().find(|l| l.starts_with("ERROR")) {
+                        bail!("ETH mode: {}", e.trim_start_matches("ERROR").trim_start_matches(':').trim());
+                    }
+                    println!(
+                        "{}",
+                        if *m == OnOff::On { "ETH mode on: both ends now show a USB network adapter" } else { "ETH mode off" }.green()
+                    );
+                    println!("the USB device re-enumerates (the serial port is back in a second)");
+                    Ok(())
                 }
                 Cmd::List | Cmd::Term { .. } => unreachable!(),
             }

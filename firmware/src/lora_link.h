@@ -66,5 +66,12 @@ uint32_t random32();
 size_t fastTake(uint8_t* buf, size_t max);       // next bytes to send; 0 while a LoRa data frame is still in flight
 void fastRequeue(const uint8_t* d, size_t n);    // bytes that did not make it: back to the front of the queue
 void fastDeliver(const uint8_t* d, size_t n);    // bytes received over 2.4 GHz
+void setFastRxMux(bool mux);                     // ... are a framed stream (told by the peer for the session)
+
+// ---- ETH mode (see eth.h): IP packets share the reliable byte stream with the serial data
+void setMux(bool want);        // frame the stream (takes effect once the queue has drained)
+bool muxActive();              // the stream we send is framed now
+bool queuePacket(const uint8_t* ip, size_t len);  // IP packet for the peer; false = dropped
+void setNetHandler(void (*cb)(const uint8_t* ip, size_t len));  // IP packet from the peer
 
 }  // namespace link

@@ -42,6 +42,9 @@ lbridge monitor              # 实时状态行
 lbridge fast on              # 协商切换到 2.4GHz 高速模式（固件 1.3.0+），等待结果；失败时给出原因
 lbridge fast off             # 切回 LoRa
 lbridge fast                 # 查询高速模式状态
+lbridge eth on               # 开启网卡模式（固件 1.4.0+）：两端各多出一个 USB 网卡并自动分配 IP；USB 会重新枚举
+lbridge eth off | eth        # 关闭 / 查询状态
+lbridge set ethcfg 10.211.0.0/30,10.211.0.1,10.211.0.2   # 网段、主端 IP、从端 IP（也可分别 set ethnet / ethmip / ethsip）
 ```
 
 配置命令使用设备的带内控制通道（`ESC ] L B ; <AT 命令> BEL`），终端运行期间也可以用，不会混入串口数据，也不需要 `+++`。

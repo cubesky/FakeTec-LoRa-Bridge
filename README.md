@@ -4,7 +4,7 @@
 
 | 目录 | 内容 |
 |---|---|
-| [`firmware/`](firmware/) | nRF52840 固件（PlatformIO）：LoRa 跳频 / 重传 / 加密 / 压缩、省电待机、USB 串口 + WebUSB、蓝牙串口与配置、UF2 / DFU 升级 |
+| [`firmware/`](firmware/) | nRF52840 固件（PlatformIO）：LoRa 跳频 / 重传 / 加密 / 压缩、2.4G 高速模式、ETH 网卡模式（USB CDC-NCM + DHCP）、省电待机、USB 串口 + WebUSB、蓝牙串口与配置、UF2 / DFU 升级 |
 | [`client-rust/`](client-rust/) | 命令行客户端 `lbridge`：彩色终端 + 配置（Windows / Linux / macOS） |
 | [`client-web/`](client-web/) | WebUSB 网页控制台：终端 + 配置 |
 | [`openwrt/luci-app-lora-bridge/`](openwrt/luci-app-lora-bridge/) | OpenWrt 插件：设备插入时启动 Docker 容器并把容器内的虚拟串口连到设备 |
